@@ -8,6 +8,8 @@ import {
   maxAbs,
   flatten2D,
   MODE_META,
+  PARAM_COUNT,
+  LOWRANK_R,
   DATASET_SIZE,
   Mode,
   Simulation,
@@ -62,8 +64,8 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 export default function TrainingApp() {
   const sims = useMemo(() => buildSimulations(), []);
-  const [mode, setMode] = useState<Mode>("dense4");
-  const [steps, setSteps] = useState<Record<Mode, number>>({ dense4: 0, sparse: 0, dense16: 0 });
+  const [mode, setMode] = useState<Mode>("sparse");
+  const [steps, setSteps] = useState<Record<Mode, number>>({ dense16: 0, sparse: 0, lowrank: 0 });
   const [example, setExample] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(2);
@@ -169,12 +171,12 @@ export default function TrainingApp() {
               <span>·</span>
               <span className="text-gray-300">training</span>
             </div>
-            <h1 className="text-2xl font-bold tracking-tight">Two-Layer Net Training with Adam</h1>
+            <h1 className="text-2xl font-bold tracking-tight">Approximating a Big Dense Net</h1>
             <p className="text-sm text-gray-400 max-w-3xl mt-1 leading-snug">
-              The data comes from a fixed 2-layer teacher network (two 4×4 matrices, tanh hidden +
-              tanh output). Three students — all 2-layer with the same activations — are trained on
-              it with Adam. Compare a matched 4×4 net, a sparse lifted net, and a full dense lifted
-              net.
+              The data comes from a randomly-initialised big dense 2-layer network. Three students
+              try to reproduce it: the full dense net (realizable reference), a sparse net, and a
+              low-rank net — the last two parameter-matched, to see which structure approximates a
+              big dense network better at equal budget.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 justify-end">
@@ -196,7 +198,7 @@ export default function TrainingApp() {
 
         {/* tabs */}
         <div className="inline-flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-1">
-          {(["dense4", "sparse", "dense16"] as Mode[]).map((m) => (
+          {(["dense16", "sparse", "lowrank"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => {
@@ -207,7 +209,7 @@ export default function TrainingApp() {
                 mode === m ? "bg-sky-600 text-white" : "text-gray-400 hover:text-gray-200"
               }`}
             >
-              {m === "dense4" ? "Dense 4×4" : m === "sparse" ? "Sparse" : "Dense 16×16"}
+              {m === "dense16" ? "Dense 16×16" : m === "sparse" ? "Sparse" : "Low-rank"}
             </button>
           ))}
         </div>
@@ -281,6 +283,7 @@ export default function TrainingApp() {
           </div>
 
           <div className="flex flex-wrap gap-2">
+            <Stat label="Params" value={String(PARAM_COUNT[mode])} />
             <Stat label="Step" value={String(step)} />
             <Stat label="Epoch / batch" value={`E${frame.epoch + 1} · B${frame.batchInEpoch + 1}`} />
             <Stat label="Batch loss" value={num(frame.dataBatchLoss)} />
@@ -315,7 +318,9 @@ export default function TrainingApp() {
               <div key={i}>
                 <div className="flex items-center gap-3 mb-1.5">
                   <span className="text-sm font-semibold text-gray-200">Layer {i + 1}</span>
-                  <span className="text-[11px] text-gray-500">{L.sparse ? "sparse" : "dense"}</span>
+                  <span className="text-[11px] text-gray-500">
+                    {mode === "sparse" ? "sparse" : mode === "lowrank" ? `rank ${LOWRANK_R}` : "dense"}
+                  </span>
                   {L.sparse && (
                     <span className="flex items-center gap-3 text-[11px] text-gray-400">
                       <span className="flex items-center gap-1.5">

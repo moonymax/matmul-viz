@@ -87,17 +87,32 @@ richness constant as the matrix grows, at `O(n)` params/ops vs dense `O(n²)`.
 
 ## Operation counts (MACs per example, mixing matrices only)
 
-Per trainable layer, `n = 16`, `k` = active cells:
+Per trainable layer, `n = 16`, `k` = active cells, `B` = batch size:
 
-| Stage | Sparse (`k`) | Dense (`n²` = 256) |
+| Stage | Sparse | Dense (`n²` = 256) |
 |---|---:|---:|
 | Forward `W·h` | `k` | 256 |
-| Backward (weight grads) | `k` | 256 |
+| Backward — weight grad (active cells only) | `k` | 256 |
+| Backward — input grad `Wᵀ·da` (active only) | `k` | 256 |
 | Adam update | `k` | 256 |
 
-Forward and backward both scale as `O(k)` (sparse) vs `O(n²)` (dense). The tanh
-activations add one cheap elementwise op per unit (`O(n)`), negligible next to
-the mixing. Two layers just double every count.
+The demo's sparse trainer never materializes the `n²` gradient. It computes the
+`k` active-cell gradients directly (`gW[i,j] = Σ_b da_b[i]·h_b[j]` over the `k`
+active `(i,j)`), and for growth it uses an **approximate top-p × top-q search**
+instead of scanning all `n²` inactive cells:
+
+- the batch gradient `gW = Σ_b da_b ⊗ h_b` has rank ≤ `B`, held implicitly in the
+  skinny error/input matrices already computed;
+- `|gW[i,j]|` is large when row `i` (error) and column `j` (input) are both
+  large, so only the top `p` rows × top `q` cols are scored — cost
+  `O(p·q·B)` ≪ `O(n²)`.
+
+So forward **and** backward are `O(k)`, not `O(n²)`. The trade-off is accuracy:
+the cheap grow can miss the true best cell. Measured here (72 cells/layer, big
+dense teacher): exact-grow data loss ≈ 0.013, approximate-grow ≈ 0.017 — a small
+cost for dropping the `O(n²)` grow search. The tanh activations add one cheap
+elementwise op per unit (`O(n)`), negligible next to the mixing; two layers just
+double every count.
 
 **Caveats.**
 
@@ -106,3 +121,6 @@ the mixing. Two layers just double every count.
    patterns (block, 2:4) to map onto dense compute units.
 2. At `n = 16` the absolute numbers are tiny; the `O(k)` vs `O(n²)` scaling is
    the point, not the specific integers.
+3. RigL-style methods instead pay the exact `O(n²)` gradient but only every ΔT
+   steps (amortized); the approximate search here is the cheaper, every-step end
+   of that trade-off.
