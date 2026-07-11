@@ -31,7 +31,7 @@ const SEED = 17;
 export const SPARSE_DIM = 16;
 const SPARSE_ROUTING_SEED = 91;
 const SPARSE_L1 = 0.05;
-export const ACTIVE_COUNT = 72; // trainable cells per sparse layer
+export const ACTIVE_COUNT = 51; // trainable cells per sparse layer
 // Low-rank factorization W = A·B uses rank r → 2·dim·r params per layer.
 // Pick r so the low-rank param count is as close as possible to the sparse one.
 export const LOWRANK_R = Math.max(1, Math.round(ACTIVE_COUNT / (2 * SPARSE_DIM)));
