@@ -4,24 +4,15 @@ import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import Link from "next/link";
 import {
   buildSimulations,
-  sparsePredict,
-  matVecPublic,
-  msePublic,
+  forwardModel,
   maxAbs,
   flatten2D,
   MODE_META,
   DATASET_SIZE,
-  SPARSE_DIM,
   Mode,
-  Frame,
   Simulation,
 } from "@/lib/sparseTraining";
-import {
-  renderBarChart,
-  renderHeatmap,
-  renderSparseHeatmap,
-  renderLossChart,
-} from "@/lib/trainingCharts";
+import { renderBarChart, renderSparseHeatmap, renderLossChart } from "@/lib/trainingCharts";
 
 const SPEED_INTERVAL = 150; // ms at 1×
 
@@ -39,20 +30,22 @@ function Card({
   sub,
   children,
   full = false,
+  className = "",
 }: {
   title: string;
   sub?: string;
   children: React.ReactNode;
   full?: boolean;
+  className?: string;
 }) {
   return (
     <div
       className={`rounded-xl bg-gray-900/70 border border-gray-800 p-4 ${
         full ? "col-span-full" : ""
-      }`}
+      } ${className}`}
     >
       <h2 className="text-base font-semibold text-gray-100">{title}</h2>
-      {sub && <p className="text-xs text-gray-400 mt-0.5 mb-3 leading-snug min-h-[2.2em]">{sub}</p>}
+      {sub && <p className="text-xs text-gray-400 mt-0.5 mb-3 leading-snug">{sub}</p>}
       {children}
     </div>
   );
@@ -69,12 +62,8 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 export default function TrainingApp() {
   const sims = useMemo(() => buildSimulations(), []);
-  const [mode, setMode] = useState<Mode>("nonlinear");
-  const [steps, setSteps] = useState<Record<Mode, number>>({
-    nonlinear: 0,
-    sparse: 0,
-    dense16: 0,
-  });
+  const [mode, setMode] = useState<Mode>("dense4");
+  const [steps, setSteps] = useState<Record<Mode, number>>({ dense4: 0, sparse: 0, dense16: 0 });
   const [example, setExample] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(2);
@@ -95,7 +84,6 @@ export default function TrainingApp() {
     [mode, sim.frames.length]
   );
 
-  // playback
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
     if (!playing) return;
@@ -114,99 +102,59 @@ export default function TrainingApp() {
     };
   }, [playing, speed, mode, sim.frames.length]);
 
-  const usesLift = mode !== "nonlinear";
-
-  const predOf = useCallback(
-    (idx: number, f: Frame) =>
-      mode !== "nonlinear"
-        ? sparsePredict(f.W, sim.X[idx], sim.routing!).pred
-        : matVecPublic(f.W, sim.X[idx]),
-    [mode, sim]
-  );
-
-  // ---- chart html ----
   const charts = useMemo(() => {
+    const dim = sim.cfg.dim;
     const x = sim.X[example];
-    const target = sim.targets[example];
-    const liftView = usesLift ? sparsePredict(frame.W, x, sim.routing!) : null;
-    const pred = liftView ? liftView.pred : matVecPublic(frame.W, x);
-    const vecMax = maxAbs(target.concat(pred));
+    const y = sim.targets[example];
+    const pred = forwardModel(frame.layers[0].W, frame.layers[1].W, x, sim.cfg).pred;
+    const vecMax = maxAbs(y.concat(pred));
+    const yL = ["y1", "y2", "y3", "y4"];
 
-    const input = usesLift
-      ? renderBarChart(
-          liftView!.lifted,
-          Array.from({ length: SPARSE_DIM }, (_, i) => `z${i + 1}`),
-          { title: "Dense lifted vector z = U·x", maxAbs: maxAbs(liftView!.lifted), width: 520, height: 300 }
-        )
-      : renderBarChart(x, ["x1", "x2", "x3", "x4"], {
-          title: "Input vector",
-          maxAbs: maxAbs(x),
+    const target = renderBarChart(y, yL, { title: "Target", maxAbs: vecMax, width: 300, height: 210 });
+    const predChart = renderBarChart(pred, yL, {
+      title: "Predicted",
+      maxAbs: vecMax,
+      width: 300,
+      height: 210,
+    });
+
+    const layers = frame.layers.map((L, li) => {
+      const active = L.active ?? [];
+      const hm = (m: number[][], title: string, markers = false) =>
+        renderSparseHeatmap(m, {
+          size: dim,
+          title,
+          maxAbs: maxAbs(flatten2D(m)),
+          activePositions: active,
+          grown: markers ? L.grown : null,
+          pruned: markers ? L.pruned : null,
+          width: 300,
+          height: 250,
         });
+      return {
+        sparse: L.active !== undefined,
+        grown: L.grown,
+        pruned: L.pruned,
+        weights: hm(L.W, `W${li + 1} — weights`, true),
+        grad: hm(L.grad, `∂L/∂W${li + 1} — gradient`),
+        mom: hm(L.m, `momentum (Adam m)`),
+      };
+    });
 
-    const rowL = ["y1", "y2", "y3", "y4"];
-    const colL = ["x1", "x2", "x3", "x4"];
-    // sparse tracks a moving active set; dense16 has every cell active
-    const activePos =
-      mode === "dense16" ? [] : frame.activePositions ?? sim.routing?.positions ?? [];
-    const heat = (
-      m: number[][],
-      title: string,
-      digits: number,
-      markers = false
-    ) =>
-      usesLift
-        ? renderSparseHeatmap(m, {
-            title,
-            digits,
-            maxAbs: maxAbs(flatten2D(m)),
-            activePositions: activePos,
-            grown: markers && mode === "sparse" ? frame.grown : null,
-            pruned: markers && mode === "sparse" ? frame.pruned : null,
-          })
-        : renderHeatmap(m, rowL, colL, { title, digits, maxAbs: maxAbs(flatten2D(m)) });
+    const loss = renderLossChart(
+      sim.frames.map((f) => f.fullLoss),
+      sim.frames.map((f) => f.batchLoss),
+      step,
+      { title: "Loss over training" }
+    );
 
-    const batchLossValues = frame.batchIndices.map((i) => msePublic(predOf(i, frame), sim.targets[i]));
-    const selectedInBatch = frame.batchIndices.indexOf(example);
-
-    return {
-      input,
-      weight: heat(
-        frame.W,
-        mode === "sparse"
-          ? "Dynamic 16×16 scaffold"
-          : mode === "dense16"
-          ? "Dense 16×16 scaffold"
-          : "Learned weight matrix",
-        2,
-        true
-      ),
-      grad: heat(frame.grad, "Gradient  dL/dW", 3),
-      m1: heat(frame.m, "Adam 1st moment (m)", 4),
-      m2: heat(frame.v, "Adam 2nd moment (v)", 4),
-      target: renderBarChart(target, rowL, { title: "Target vector", maxAbs: vecMax }),
-      pred: renderBarChart(pred, rowL, { title: "Predicted vector", maxAbs: vecMax }),
-      batch: renderBarChart(
-        batchLossValues,
-        frame.batchIndices.map((i) => `#${i + 1}`),
-        {
-          title: "Mini-batch data losses",
-          maxAbs: Math.max(...batchLossValues),
-          positiveOnly: true,
-          digits: 4,
-          selectedIndex: selectedInBatch >= 0 ? selectedInBatch : undefined,
-          selectedLabel: selectedInBatch >= 0 ? `selected #${example + 1}` : "",
-        }
-      ),
-      loss: renderLossChart(
-        sim.frames.map((f) => f.fullLoss),
-        sim.frames.map((f) => f.batchLoss),
-        step,
-        { title: "Loss over training" }
-      ),
-    };
-  }, [sim, frame, mode, usesLift, example, step, predOf]);
+    return { target, pred: predChart, layers, loss };
+  }, [sim, frame, example, step]);
 
   const num = (v: number, d = 6) => v.toFixed(d);
+  // data loss only (L1 penalty excluded) at the last training step, so the
+  // number is comparable across tabs regardless of the L1 term.
+  const finalDataLoss = sim.frames[sim.frames.length - 1].dataFullLoss;
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -221,11 +169,12 @@ export default function TrainingApp() {
               <span>·</span>
               <span className="text-gray-300">training</span>
             </div>
-            <h1 className="text-2xl font-bold tracking-tight">Matrix Training with Adam</h1>
+            <h1 className="text-2xl font-bold tracking-tight">Two-Layer Net Training with Adam</h1>
             <p className="text-sm text-gray-400 max-w-3xl mt-1 leading-snug">
-              Train a 4×4 linear model against a nonlinear target, then compare a sparse
-              reparameterization of the same model. Both use Adam — inspect the gradient alongside
-              its running moments as you scrub through every mini-batch.
+              The data comes from a fixed 2-layer teacher network (two 4×4 matrices, tanh hidden +
+              tanh output). Three students — all 2-layer with the same activations — are trained on
+              it with Adam. Compare a matched 4×4 net, a sparse lifted net, and a full dense lifted
+              net.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 justify-end">
@@ -247,7 +196,7 @@ export default function TrainingApp() {
 
         {/* tabs */}
         <div className="inline-flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-1">
-          {(["nonlinear", "sparse", "dense16"] as Mode[]).map((m) => (
+          {(["dense4", "sparse", "dense16"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => {
@@ -258,11 +207,7 @@ export default function TrainingApp() {
                 mode === m ? "bg-sky-600 text-white" : "text-gray-400 hover:text-gray-200"
               }`}
             >
-              {m === "nonlinear"
-                ? "Nonlinear data"
-                : m === "sparse"
-                ? "Sparse matrix"
-                : "Dense 16×16"}
+              {m === "dense4" ? "Dense 4×4" : m === "sparse" ? "Sparse" : "Dense 16×16"}
             </button>
           ))}
         </div>
@@ -338,85 +283,74 @@ export default function TrainingApp() {
           <div className="flex flex-wrap gap-2">
             <Stat label="Step" value={String(step)} />
             <Stat label="Epoch / batch" value={`E${frame.epoch + 1} · B${frame.batchInEpoch + 1}`} />
-            <Stat label="Batch loss" value={num(frame.dataBatchLoss ?? frame.batchLoss)} />
-            <Stat label="L1 penalty" value={num(frame.l1Penalty ?? 0)} />
+            <Stat label="Batch loss" value={num(frame.dataBatchLoss)} />
+            <Stat label="L1 penalty" value={num(frame.l1Penalty)} />
             <Stat label="Total loss" value={num(frame.fullLoss)} />
-            <Stat label="Final loss" value={num(sim.frames[sim.frames.length - 1].fullLoss)} />
+            <Stat label="Final data loss" value={num(finalDataLoss)} />
             <Stat label="Grad norm" value={num(frame.gradNorm)} />
           </div>
         </div>
 
-        {/* charts grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <Card
-            title={usesLift ? "Dense lifted input" : "Input vector"}
-            sub={
-              usesLift
-                ? `Example #${example + 1}: the 4-vector is lifted into a dense 16D vector before the scaffold.`
-                : `Selected example #${example + 1} of ${DATASET_SIZE}.`
-            }
-          >
-            <Svg html={charts.input} />
-          </Card>
-
-          <Card
-            title={mode === "nonlinear" ? "Learned weight matrix" : "Scaffold weights"}
-            sub={
-              mode === "sparse"
-                ? "Updated by Adam. Active cells move over training: grown from zero, pruned when near-zero and stable."
-                : mode === "dense16"
-                ? "All 256 cells trainable — same fixed lift/unlift as the sparse tab, but no sparsity."
-                : "Updated by gradients from the current mini-batch."
-            }
-          >
-            <Svg html={charts.weight} />
-            {mode === "sparse" && (
-              <div className="flex items-center gap-4 text-[11px] text-gray-400 mt-1">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3 h-3 rounded-sm border-2 border-green-400" /> grown
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3 h-3 rounded-sm border-2 border-dashed border-red-400" /> pruned
-                </span>
-                {frame.grown && frame.pruned ? (
-                  <span className="text-gray-300 font-mono">
-                    +({frame.grown[0]},{frame.grown[1]}) −({frame.pruned[0]},{frame.pruned[1]})
-                  </span>
-                ) : (
-                  <span className="text-gray-600">no swap this step</span>
-                )}
-              </div>
-            )}
-          </Card>
-
-          <Card title="Target vector" sub={meta.targetSub}>
+        {/* target + predicted, small, side by side */}
+        <div className="flex flex-wrap gap-4">
+          <Card title="Target vector" sub="Teacher output for the selected example." className="w-72">
             <Svg html={charts.target} />
           </Card>
-
-          <Card title="Gradient & Adam moments" sub="The gradient drives the update; Adam keeps a first-moment (m) and second-moment (v) EMA beside it." full>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <Svg html={charts.grad} />
-              <Svg html={charts.m1} />
-              <Svg html={charts.m2} />
-            </div>
-          </Card>
-
-          <Card title="Predicted vector" sub="Model output for the selected example at this step.">
+          <Card
+            title="Predicted vector"
+            sub="Student output at this training step."
+            className="w-72"
+          >
             <Svg html={charts.pred} />
           </Card>
-
-          <Card title="Mini-batch losses" sub={meta.batchSub}>
-            <Svg html={charts.batch} />
-          </Card>
-
-          <Card
-            title="Loss over training"
-            sub="Blue: full-dataset loss. Red: current mini-batch objective. Sparse mode includes the L1 penalty."
-            full
-          >
-            <Svg html={charts.loss} />
-          </Card>
         </div>
+
+        {/* whole-network weights / gradient / momentum */}
+        <Card
+          title="Network weights · gradient · momentum"
+          sub="Both layers of the network. Per layer: the weights, the gradient ∂L/∂W, and Adam's momentum (first moment m)."
+        >
+          <div className="space-y-4">
+            {charts.layers.map((L, i) => (
+              <div key={i}>
+                <div className="flex items-center gap-3 mb-1.5">
+                  <span className="text-sm font-semibold text-gray-200">Layer {i + 1}</span>
+                  <span className="text-[11px] text-gray-500">{L.sparse ? "sparse" : "dense"}</span>
+                  {L.sparse && (
+                    <span className="flex items-center gap-3 text-[11px] text-gray-400">
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-3 rounded-sm border-2 border-green-400" /> grown
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-3 rounded-sm border-2 border-dashed border-red-400" /> pruned
+                      </span>
+                      {L.grown && L.pruned ? (
+                        <span className="text-gray-300 font-mono">
+                          +({L.grown[0]},{L.grown[1]}) −({L.pruned[0]},{L.pruned[1]})
+                        </span>
+                      ) : (
+                        <span className="text-gray-600">no swap this step</span>
+                      )}
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <Svg html={L.weights} />
+                  <Svg html={L.grad} />
+                  <Svg html={L.mom} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        {/* loss curve */}
+        <Card
+          title="Loss over training"
+          sub="Blue: full-dataset loss. Red: current mini-batch objective (sparse includes L1)."
+        >
+          <Svg html={charts.loss} />
+        </Card>
       </div>
     </div>
   );

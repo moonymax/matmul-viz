@@ -1,124 +1,108 @@
-# Sparse vs. dense matrix: accuracy and operation efficiency
+# Two-layer sparse vs. dense: accuracy and operation efficiency
 
-This note compares the three models in the `/train` demo. All three learn the
-same task — approximate a **nonlinear** target `y = nonlinear(A·x)` (hidden 4×4
-matrix `A`) with a **linear** model — on the same dataset, with the same Adam
-optimizer.
-
-| Tab | Model | Trainable params | Final full-dataset loss |
-|---|---|---:|---:|
-| Nonlinear data | plain dense `4×4` (`pred = W·x`) | 16 | **0.420** |
-| Sparse matrix | lifted, `18` movable cells (grow-and-prune) | 18 | **0.509** |
-| Dense 16×16 | lifted, all `256` cells trainable | 256 | **0.430** |
-
-Both lifted models compute `pred = Uᵀ · W · (U · x)`, where `U` is a **fixed**
-`16×4` up-projection (orthonormal columns) and `Uᵀ` is the down-projection. The
-lift/unlift exist only to give a larger scaffold something to act on so the
-three models see comparable data — they are **not** part of the model capacity
-and are **excluded** from the op counts below.
-
-## Why more parameters barely help
-
-The effective transform is `Uᵀ W U`. Because `U` is `16×4` with rank 4, this
-collapses to a **4×4 matrix no matter what `W` is**. So:
-
-- The dense `16×16` (256 params) can represent *any* 4×4 effective map — but so
-  can the plain `4×4` (16 params). They share the same optimum (~0.42).
-- The extra 240 dense parameters live in the null space of the lift and buy
-  nothing.
-- The task's real ceiling is "best linear fit to a nonlinear map," i.e. a
-  rank-4 bottleneck. Everyone hits roughly the same floor.
-
-The sparse model (18 cells) lands close (0.51) despite ~14× fewer parameters,
-because the dense capacity was redundant to begin with.
-
-## Operation counts (MACs per example, mixing matrix `W` only)
-
-Lift/unlift costs are excluded by request — they are shared, fixed overhead used
-only to make the data comparable. What remains is the cost of the trainable
-matrix `W` itself.
-
-Let `n = 16` (scaffold side), `nnz = 18` (active cells in the sparse model).
-
-| Stage | What is computed | Sparse (`nnz`) | Dense (`n²`) |
-|---|---|---:|---:|
-| Forward | `mixed = W · z` | **18** | **256** |
-| Backward (weight grads) | `∂L/∂W[i,j] = back[i]·z[j]` | **18** | **256** |
-| Optimizer update | Adam step per parameter | 18 | 256 |
-
-- **Forward:** `O(nnz)` vs `O(n²)` → sparse is `256 / 18 ≈ 14×` cheaper.
-- **Backward:** same `O(nnz)` vs `O(n²)` — the gradient only exists at the
-  active cells for the sparse model, at all cells for the dense one.
-- `back = U · (∂L/∂pred)` (turning the output error into a lifted-space error) is
-  part of the unlift and is therefore excluded; it is identical for both models.
-
-## Takeaway (linear case)
-
-Sparse achieves comparable accuracy (0.51 vs 0.43) at **~14× fewer parameters
-and ~14× fewer mixing operations**, on both the forward and backward pass. But
-this is "nearly free" only because the dense matrix is over-provisioned for the
-effective rank of the problem — exactly the regime where pruning real networks
-works.
-
-## Adding a nonlinearity
-
-Both lifted models were then made genuinely nonlinear by applying an elementwise
-activation `φ` in the 16-D space:
+The `/train` demo trains three student networks on data from a fixed **2-layer
+teacher**:
 
 ```
-pred = Uᵀ · φ(W · U·x)
+y = tanh(W2ᵗ · tanh(W1ᵗ · x))          (two 4×4 matrices, tanh hidden + output)
 ```
 
-This is a 1-hidden-layer net (16 hidden units) with fixed lift/unlift and a
-trainable middle matrix `W`. The plain `4×4` tab stays linear as the reference.
+All three students are 2-layer with the same two tanh activations:
 
-**Crucially, `φ` is the *same* nonlinearity that generated the target data:**
+| Tab | Architecture | Trainable params |
+|---|---|---:|
+| Dense 4×4 | `tanh(W₂ · tanh(W₁ · x))`, two 4×4 | 32 |
+| Sparse | `tanh(Uᵀ·(W₂·tanh(W₁·U·x)))`, two 16×16, `k` cells/layer, grow-and-prune + L1 | `2k` |
+| Dense 16×16 | same lifted form, both 16×16 fully trainable | 512 |
+
+`U` is a fixed orthonormal `16×4` lift and `Uᵀ` the down-projection; they exist
+only to give the lifted models a larger scaffold on comparable 4-D data and are
+excluded from the op counts below.
+
+## ⚠️ The L1 penalty must be netted out of the sparse "final loss"
+
+**The sparse model is trained with an L1 penalty on its active weights; the two
+dense models have no L1. So the sparse tab's reported "Total / Final loss"
+includes a term the dense tabs never pay.** To compare *fit quality* fairly you
+must subtract it:
 
 ```
-φ(v) = tanh(2.85·v) + 0.55·sin(5.5·v + 0.35) + 0.18·sin(11·v²)
+data loss (sparse) = total loss − L1 penalty
 ```
 
-| Model | Params | Linear loss | Nonlinear loss (φ) |
-|---|---:|---:|---:|
-| Nonlinear data (linear `4×4`) | 16 | 0.420 | 0.420 (unchanged) |
-| Sparse (18 cells) | 18 | 0.509 | **0.355** |
-| Dense 16×16 | 256 | 0.430 | **0.398** |
+Worked example, sparse with `k = 144` cells/layer at the end of training:
 
-Two observations:
+| Component | Value |
+|---|---:|
+| Total loss (the "Final loss" stat) | 0.0309 |
+| − L1 penalty | 0.0224 |
+| **= data loss (comparable to the dense tabs)** | **≈ 0.008** |
 
-1. **Both nonlinear models break the 0.42 linear ceiling** — the activation
-   gives them capacity the linear map fundamentally lacked.
-2. **The 256-param dense model does *not* beat the 18-param sparse one** here
-   (0.398 vs 0.355); they are comparable, and sparse is marginally ahead.
+Here the L1 term is ~72% of the reported number, so comparing raw totals across
+tabs overstates the sparse model's disadvantage by roughly that much. The UI
+therefore reports **"Final data loss"** = `dataFullLoss` (L1 already removed) as
+the cross-tab comparison metric, alongside **"Total loss"** = the training
+objective (data + L1) and the **"L1 penalty"** term itself, so the split is
+always visible.
 
-**Why the extra capacity doesn't dominate.** `φ` is strongly oscillatory — its
-derivative `φ'(v)` contains a `3.96·v·cos(11·v²)` term that swings wildly once
-`|v|` grows past ~1. The dense matrix drives larger pre-activations
-`a = W·(U·x)` (16 contributions per unit, so bigger magnitude), landing many
-hidden units in that chaotic regime where gradients are noisy and `φ` itself is
-erratic. The sparse matrix keeps pre-activations small and tame, so despite far
-fewer parameters it optimizes at least as cleanly. (This is sensitive to init
-scale and learning rate — the point is that more parameters is not automatically
-better when the activation is this irregular.)
+## Accuracy — data loss only (fair)
 
-### Aside: a *mismatched* activation flips the result
+| Student | Params | Data loss |
+|---|---:|---:|
+| Dense 4×4 (teacher-matched) | 32 | 0.0051 |
+| Sparse (`k = 144`/layer) | 288 | ≈ 0.008 |
+| Dense 16×16 | 512 | 0.00067 |
 
-As a control, using a plain `tanh` activation instead of the true `φ` gives:
-sparse 0.471, dense **0.193**. There the dense model wins decisively, because a
-smooth monotone `tanh` rewards having 16 independent input directions (one rich
-feature per hidden unit) and the sparse model (≈1 weight per row) can't form
-them. So whether dense capacity helps depends heavily on the activation:
-smooth/monotone → dense wins big; matched-but-oscillatory → the advantage
-evaporates.
+- **Dense 4×4** fits well with few parameters because its architecture *is* the
+  teacher's — the 32 weights are perfectly placed.
+- **Dense 16×16** fits best; large capacity nails a genuinely 2-layer target.
+- **Sparse**, once the L1 term is removed, fits nearly as well as the matched
+  net — capacity/placement, not raw count, is what separates the three.
 
-The op-count ratio is unchanged either way (the activation adds one cheap
-elementwise op per hidden unit, `O(n)`, negligible next to the `O(nnz)` vs
-`O(n²)` mixing): sparse is still ~14× cheaper per step.
+### Sparse density sweep (reported total loss, i.e. *with* L1)
+
+| `k` (cells/layer) | ≈ nonzeros/row | Total loss (incl. L1) |
+|---:|---:|---:|
+| 18 | 1.1 | 0.070 |
+| 36 | 2.25 | 0.052 |
+| 144 | 9.0 | 0.031 |
+
+More connections per hidden unit → richer features → lower loss, with
+diminishing returns. Remember these totals still include L1; the underlying data
+loss is lower and closes most of the gap to the matched net.
+
+## Nonzeros-per-row scaling
+
+Average nonzeros per row `= k / n` for an `n×n` layer with `k` active cells.
+
+| Budget policy | `k` | nonzeros/row | forward/backward ops |
+|---|---|---|---|
+| Fixed param count | `const` | `k/n` → O(1/n) | O(k) |
+| Fixed sparsity fraction `s` | `s·n²` | `s·n` → O(n) | O(s·n²) |
+| Fixed fanin `d` per row | `d·n` | `d` → constant | O(d·n) |
+
+A hidden unit computes `tanh(rowᵢ · z)`, so it needs several nonzeros per row to
+form a useful input direction. Only the **fixed-fanin** policy keeps per-unit
+richness constant as the matrix grows, at `O(n)` params/ops vs dense `O(n²)`.
+
+## Operation counts (MACs per example, mixing matrices only)
+
+Per trainable layer, `n = 16`, `k` = active cells:
+
+| Stage | Sparse (`k`) | Dense (`n²` = 256) |
+|---|---:|---:|
+| Forward `W·h` | `k` | 256 |
+| Backward (weight grads) | `k` | 256 |
+| Adam update | `k` | 256 |
+
+Forward and backward both scale as `O(k)` (sparse) vs `O(n²)` (dense). The tanh
+activations add one cheap elementwise op per unit (`O(n)`), negligible next to
+the mixing. Two layers just double every count.
 
 **Caveats.**
 
-1. These are MAC counts, not wall-clock. Unstructured sparsity typically does
-   not beat dense hardware until very high sparsity (~90%+) and usually needs
-   *structured* patterns (block, 2:4) to map onto dense compute units.
-2. At `n = 16` the absolute numbers are tiny; it is the `O(nnz)` vs `O(n²)`
-   scaling that matters, not these specific integers.
+1. MAC counts, not wall-clock. Unstructured sparsity usually doesn't beat dense
+   hardware until very high sparsity (~90%+) and typically needs *structured*
+   patterns (block, 2:4) to map onto dense compute units.
+2. At `n = 16` the absolute numbers are tiny; the `O(k)` vs `O(n²)` scaling is
+   the point, not the specific integers.
