@@ -10,6 +10,7 @@ import {
   MODE_META,
   PARAM_COUNT,
   LOWRANK_R,
+  SPARSE_DIM,
   DATASET_SIZE,
   Mode,
   Simulation,
@@ -209,7 +210,7 @@ export default function TrainingApp() {
                 mode === m ? "bg-sky-600 text-white" : "text-gray-400 hover:text-gray-200"
               }`}
             >
-              {m === "dense16" ? "Dense 16×16" : m === "sparse" ? "Sparse" : "Low-rank"}
+              {m === "dense16" ? `Dense ${SPARSE_DIM}×${SPARSE_DIM}` : m === "sparse" ? "Sparse" : "Low-rank"}
             </button>
           ))}
         </div>

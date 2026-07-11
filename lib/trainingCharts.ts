@@ -150,6 +150,10 @@ interface SparseOpts extends HeatOpts {
   pruned?: [number, number] | null;
 }
 
+// Max cells drawn per side for a fully-dense matrix; larger matrices are
+// block-averaged down to this so we never emit tens of thousands of rects.
+const DISPLAY_CAP = 32;
+
 export function renderSparseHeatmap(matrix: Matrix, opts: SparseOpts = {}): string {
   const size = opts.size || SPARSE_DIM;
   const width = opts.width || 420;
@@ -157,7 +161,6 @@ export function renderSparseHeatmap(matrix: Matrix, opts: SparseOpts = {}): stri
   const title = opts.title || "";
   const maxAbsValue = opts.maxAbs || maxAbs(flatten2D(matrix));
   const activePositions = opts.activePositions || [];
-  const activeSet = new Set(activePositions.map(([r, c]) => `${r}:${c}`));
   const margin = { top: 34, right: 18, bottom: 20, left: 18 };
   const innerW = width - margin.left - margin.right;
   const innerH = height - margin.top - margin.bottom;
@@ -166,28 +169,50 @@ export function renderSparseHeatmap(matrix: Matrix, opts: SparseOpts = {}): stri
 
   let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${title}">`;
   svg += `<text x="${margin.left}" y="20" font-size="15" font-weight="700" fill="${INK}">${title}</text>`;
-  for (let i = 0; i < size; i++)
-    for (let j = 0; j < size; j++) {
+  // faint backdrop so the grid extent is visible
+  svg += `<rect x="${margin.left}" y="${margin.top}" width="${innerW.toFixed(2)}" height="${innerH.toFixed(2)}" fill="rgba(255,255,255,0.03)"/>`;
+
+  if (activePositions.length > 0) {
+    // sparse: draw only the active cells (cheap regardless of matrix size)
+    for (const [i, j] of activePositions) {
       const v = matrix[i][j];
       const x = margin.left + j * cw;
       const yy = margin.top + i * ch;
-      const active = activeSet.size ? activeSet.has(`${i}:${j}`) : Math.abs(v) > 1e-12;
-      const fill = active ? divergingColor(v, maxAbsValue) : "rgba(255,255,255,0.035)";
-      const stroke = active ? "#fff" : "rgba(255,255,255,0.06)";
-      const strokeWidth = active ? 1.4 : 0.5;
-      svg += `<rect x="${x.toFixed(2)}" y="${yy.toFixed(2)}" width="${cw.toFixed(2)}" height="${ch.toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}"/>`;
+      svg += `<rect x="${x.toFixed(2)}" y="${yy.toFixed(2)}" width="${Math.max(cw, 2).toFixed(2)}" height="${Math.max(ch, 2).toFixed(2)}" fill="${divergingColor(v, maxAbsValue)}" stroke="rgba(255,255,255,0.5)" stroke-width="0.4"/>`;
     }
-
-  // grow / prune markers for the current frame
-  const marker = (pos: [number, number], color: string, dashed: boolean) => {
-    const [i, j] = pos;
-    const x = margin.left + j * cw;
-    const yy = margin.top + i * ch;
-    const dash = dashed ? ` stroke-dasharray="3 2"` : "";
-    return `<rect x="${(x - 1).toFixed(2)}" y="${(yy - 1).toFixed(2)}" width="${(cw + 2).toFixed(2)}" height="${(ch + 2).toFixed(2)}" fill="none" stroke="${color}" stroke-width="2.2"${dash}/>`;
-  };
-  if (opts.pruned) svg += marker(opts.pruned, "#f87171", true);
-  if (opts.grown) svg += marker(opts.grown, "#4ade80", false);
+    const marker = (pos: [number, number], color: string, dashed: boolean) => {
+      const [i, j] = pos;
+      const x = margin.left + j * cw;
+      const yy = margin.top + i * ch;
+      const dash = dashed ? ` stroke-dasharray="3 2"` : "";
+      const w = Math.max(cw, 2);
+      const h = Math.max(ch, 2);
+      return `<rect x="${(x - 1.5).toFixed(2)}" y="${(yy - 1.5).toFixed(2)}" width="${(w + 3).toFixed(2)}" height="${(h + 3).toFixed(2)}" fill="none" stroke="${color}" stroke-width="1.6"${dash}/>`;
+    };
+    if (opts.pruned) svg += marker(opts.pruned, "#f87171", true);
+    if (opts.grown) svg += marker(opts.grown, "#4ade80", false);
+  } else {
+    // dense: draw every cell, block-averaging down if the matrix is large
+    const D = Math.min(size, DISPLAY_CAP);
+    const dcw = innerW / D;
+    const dch = innerH / D;
+    for (let di = 0; di < D; di++)
+      for (let dj = 0; dj < D; dj++) {
+        const i0 = Math.floor((di * size) / D);
+        const i1 = Math.max(i0 + 1, Math.floor(((di + 1) * size) / D));
+        const j0 = Math.floor((dj * size) / D);
+        const j1 = Math.max(j0 + 1, Math.floor(((dj + 1) * size) / D));
+        let sum = 0;
+        let cnt = 0;
+        for (let i = i0; i < i1; i++)
+          for (let j = j0; j < j1; j++) {
+            sum += matrix[i][j];
+            cnt++;
+          }
+        const v = sum / cnt;
+        svg += `<rect x="${(margin.left + dj * dcw).toFixed(2)}" y="${(margin.top + di * dch).toFixed(2)}" width="${dcw.toFixed(2)}" height="${dch.toFixed(2)}" fill="${divergingColor(v, maxAbsValue)}"/>`;
+      }
+  }
 
   svg += `</svg>`;
   return svg;
