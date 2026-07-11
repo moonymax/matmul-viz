@@ -36,23 +36,6 @@ function fmt(value: number, digits = 2, signed = false): string {
   if (!signed) return out;
   return (value >= 0 ? "+" : "") + out;
 }
-// Compact, width-aware format so labels fit inside the small 16×16 cells.
-function fmtCompact(value: number, signed = false): string {
-  const a = Math.abs(value);
-  let s: string;
-  if (a >= 100) s = value.toFixed(0);
-  else if (a >= 10) s = value.toFixed(1);
-  else if (a >= 0.1) s = value.toFixed(2);
-  else if (a < 1e-9) s = "0";
-  else s = value.toFixed(3);
-  return signed && value >= 0 ? "+" + s : s;
-}
-// enough contrast for value text sitting on a coloured cell
-function cellText(v: number, maxAbsValue: number, positiveOnly = false): string {
-  if (positiveOnly) return Math.abs(v) > 0.5 * maxAbsValue ? "#fff" : INK;
-  return Math.abs(v) > 0.5 * maxAbsValue ? "#fff" : INK;
-}
-
 interface BarOpts {
   width?: number;
   height?: number;
@@ -130,7 +113,6 @@ export function renderHeatmap(
   const width = opts.width || 420;
   const height = opts.height || 300;
   const title = opts.title || "";
-  const digits = opts.digits ?? 2;
   const maxAbsValue = opts.maxAbs || maxAbs(flatten2D(matrix));
   const margin = { top: 34, right: 22, bottom: 42, left: 48 };
   const innerW = width - margin.left - margin.right;
@@ -148,7 +130,6 @@ export function renderHeatmap(
       const x = margin.left + j * cw;
       const yy = margin.top + i * ch;
       svg += `<rect x="${x.toFixed(2)}" y="${yy.toFixed(2)}" width="${cw.toFixed(2)}" height="${ch.toFixed(2)}" fill="${divergingColor(v, maxAbsValue)}" stroke="rgba(0,0,0,0.25)" stroke-width="0.5"/>`;
-      svg += `<text x="${(x + cw / 2).toFixed(2)}" y="${(yy + ch / 2 + 5).toFixed(2)}" font-size="13" font-weight="700" text-anchor="middle" fill="${cellText(v, maxAbsValue)}">${fmt(v, digits, true)}</text>`;
     }
   rowLabels.forEach((label, i) => {
     const yy = margin.top + i * ch + ch / 2 + 5;
@@ -182,7 +163,6 @@ export function renderSparseHeatmap(matrix: Matrix, opts: SparseOpts = {}): stri
   const innerH = height - margin.top - margin.bottom;
   const cw = innerW / size;
   const ch = innerH / size;
-  const fontSize = Math.max(5.5, Math.min(9, cw * 0.34));
 
   let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${title}">`;
   svg += `<text x="${margin.left}" y="20" font-size="15" font-weight="700" fill="${INK}">${title}</text>`;
@@ -196,9 +176,6 @@ export function renderSparseHeatmap(matrix: Matrix, opts: SparseOpts = {}): stri
       const stroke = active ? "#fff" : "rgba(255,255,255,0.06)";
       const strokeWidth = active ? 1.4 : 0.5;
       svg += `<rect x="${x.toFixed(2)}" y="${yy.toFixed(2)}" width="${cw.toFixed(2)}" height="${ch.toFixed(2)}" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}"/>`;
-      if (active) {
-        svg += `<text x="${(x + cw / 2).toFixed(2)}" y="${(yy + ch / 2 + fontSize * 0.35).toFixed(2)}" font-size="${fontSize.toFixed(1)}" font-weight="700" text-anchor="middle" fill="${cellText(v, maxAbsValue)}">${fmtCompact(v, true)}</text>`;
-      }
     }
 
   // grow / prune markers for the current frame

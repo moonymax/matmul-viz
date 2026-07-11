@@ -79,18 +79,18 @@ export const MODE_META: Record<
       "This update is driven by a mini-batch of examples from the nonlinear dataset. Adam's running moments are shown beside the gradient.",
   },
   sparse: {
-    badge: `Dynamic sparse: ${ACTIVE_COUNT} random movable weights (grow-and-prune) + dense lift + L1`,
-    note: `A fixed dense up-projection lifts the 4D input into 16D. ${ACTIVE_COUNT} cells of the 16×16 scaffold are trainable, initialised at random positions with random weights. The set is not fixed: at the start of each epoch the cell with the largest gradient (highest error × highest input activation) is grown from zero, and a near-zero, stable cell (low momentum and gradient) is pruned — so the sparsity pattern moves while the parameter count stays constant.`,
-    targetSub: "Same nonlinear target as the nonlinear tab.",
-    batchSub:
-      "This update uses the same mini-batch. The active cells drift over training via grow-and-prune; an L1 penalty keeps the active weights pressured toward zero.",
-  },
-  dense16: {
-    badge: "Dense baseline: all 256 weights trainable + same fixed lift/unlift",
-    note: "The same fixed 16D lift/unlift as the sparse tab, but every one of the 256 scaffold cells is trainable (no sparsity, no grow-and-prune, no L1). This is the full-capacity upper bound: 256 parameters versus the sparse tab's handful — useful to see how much accuracy the extra weights actually buy on the same data.",
+    badge: `Nonlinear sparse: ${ACTIVE_COUNT} movable weights + φ (grow-and-prune) + dense lift + L1`,
+    note: `pred = Uᵀ · φ(W · U·x), where φ is the SAME nonlinearity that generated the data. A fixed dense up-projection lifts the 4D input into 16D, ${ACTIVE_COUNT} cells of the 16×16 scaffold mix it, φ is applied elementwise, then a fixed down-projection reads out. The active cells are random at init and move over training: each epoch the largest-gradient cell is grown from zero and a near-zero, stable cell is pruned, keeping the parameter count constant.`,
     targetSub: "Same nonlinear target as the other tabs.",
     batchSub:
-      "This update uses the same mini-batch. All 256 cells receive a gradient and an Adam update every step.",
+      "This update uses the same mini-batch. The active cells drift via grow-and-prune; gradients backprop through φ, and an L1 penalty keeps active weights pressured toward zero.",
+  },
+  dense16: {
+    badge: "Nonlinear dense: all 256 weights + φ + same fixed lift/unlift",
+    note: "pred = Uᵀ · φ(W · U·x), with φ the same nonlinearity that generated the data and the same fixed 16D lift/unlift as the sparse tab, but every one of the 256 scaffold cells trainable (no sparsity, no grow-and-prune, no L1). With φ present, the extra capacity is no longer redundant — each hidden unit gets its own input direction — so this shows how much the full weight matrix buys once the model can actually be nonlinear.",
+    targetSub: "Same nonlinear target as the other tabs.",
+    batchSub:
+      "This update uses the same mini-batch. All 256 cells receive a gradient (backpropagated through φ) and an Adam update every step.",
   },
 };
 
@@ -166,6 +166,24 @@ function shuffleIndices(n: number, rng: () => number): number[] {
   return arr;
 }
 
+// The nonlinearity that generates the target data. The lifted models use this
+// exact function as their activation, so they can in principle match the data.
+export function dataNonlinearity(v: number): number {
+  const primary = Math.tanh(NONLIN_SCALE * v);
+  const harmonic = NONLIN_HARMONIC * Math.sin(5.5 * v + 0.35);
+  const tertiary = NONLIN_TERTIARY * Math.sin(11.0 * v * v);
+  return primary + harmonic + tertiary;
+}
+
+// φ'(v), used to backprop through the activation.
+export function dataNonlinearityDeriv(v: number): number {
+  const t = Math.tanh(NONLIN_SCALE * v);
+  const dPrimary = NONLIN_SCALE * (1 - t * t);
+  const dHarmonic = NONLIN_HARMONIC * 5.5 * Math.cos(5.5 * v + 0.35);
+  const dTertiary = NONLIN_TERTIARY * Math.cos(11.0 * v * v) * 22.0 * v;
+  return dPrimary + dHarmonic + dTertiary;
+}
+
 function buildDataset(rng: () => number) {
   const secretW: Matrix = [
     [1.6, -0.9, 0.4, 0.1],
@@ -176,14 +194,7 @@ function buildDataset(rng: () => number) {
   const X = Array.from({ length: DATASET_SIZE }, () =>
     Array.from({ length: INPUT_DIM }, () => randn(rng) * 1.15)
   );
-  const nonlinearY = X.map((x) =>
-    matVec(secretW, x).map((v) => {
-      const primary = Math.tanh(NONLIN_SCALE * v);
-      const harmonic = NONLIN_HARMONIC * Math.sin(5.5 * v + 0.35);
-      const tertiary = NONLIN_TERTIARY * Math.sin(11.0 * v * v);
-      return primary + harmonic + tertiary;
-    })
-  );
+  const nonlinearY = X.map((x) => matVec(secretW, x).map(dataNonlinearity));
   const initW = Array.from({ length: OUTPUT_DIM }, () =>
     Array.from({ length: INPUT_DIM }, () => randn(rng) * 0.85)
   );
@@ -326,10 +337,19 @@ function sparseLift(x: Vec, routing: Routing): Vec {
   return matVec(routing.up, x);
 }
 
-export function sparsePredict(W: Matrix, x: Vec, routing: Routing): { lifted: Vec; pred: Vec } {
-  const lifted = sparseLift(x, routing);
-  const mixed = matVec(W, lifted);
-  return { lifted, pred: matVec(routing.down, mixed) };
+// Nonlinear lifted model: pred = Uᵀ · φ(W · (U · x)), where φ is the SAME
+// nonlinearity that generated the target data. This makes the model genuinely
+// nonlinear (a 1-hidden-layer net with fixed lift/unlift) and lets it fit the
+// target beyond the rank-4 ceiling of the purely linear version.
+export function sparsePredict(
+  W: Matrix,
+  x: Vec,
+  routing: Routing
+): { lifted: Vec; pre: Vec; act: Vec; pred: Vec } {
+  const lifted = sparseLift(x, routing); // z = U·x
+  const pre = matVec(W, lifted); // a = W·z
+  const act = pre.map(dataNonlinearity); // h = φ(a)
+  return { lifted, pre, act, pred: matVec(routing.down, act) };
 }
 
 function fullLossSparse(W: Matrix, X: Matrix, Y: Matrix, routing: Routing): number {
@@ -366,12 +386,15 @@ function sparseDataGradAndLoss(
   let dataLoss = 0;
   const scale = 2 / (batchIndices.length * OUTPUT_DIM);
   for (const idx of batchIndices) {
-    const { lifted, pred } = sparsePredict(W, X[idx], routing);
+    const { lifted, pre, pred } = sparsePredict(W, X[idx], routing);
     dataLoss += mse(pred, targets[idx]);
     const err = pred.map((val, i) => val - targets[idx][i]);
+    // ∂L/∂h = U·err ; backprop through φ: ∂L/∂a = ∂L/∂h ⊙ φ'(a)
     const back = matVec(routing.up, err);
-    for (let i = 0; i < SPARSE_DIM; i++)
-      for (let j = 0; j < SPARSE_DIM; j++) grad[i][j] += scale * back[i] * lifted[j];
+    for (let i = 0; i < SPARSE_DIM; i++) {
+      const delta = back[i] * dataNonlinearityDeriv(pre[i]);
+      for (let j = 0; j < SPARSE_DIM; j++) grad[i][j] += scale * delta * lifted[j];
+    }
   }
   return { grad, dataLoss: dataLoss / batchIndices.length };
 }
