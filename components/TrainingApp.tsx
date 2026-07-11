@@ -111,7 +111,7 @@ export default function TrainingApp() {
     const y = sim.targets[example];
     const pred = forwardModel(frame.layers[0].W, frame.layers[1].W, x, sim.cfg).pred;
     const vecMax = maxAbs(y.concat(pred));
-    const yL = ["y1", "y2", "y3", "y4"];
+    const yL = Array.from({ length: y.length }, (_, i) => `y${i + 1}`);
 
     const target = renderBarChart(y, yL, { title: "Target", maxAbs: vecMax, width: 300, height: 210 });
     const predChart = renderBarChart(pred, yL, {

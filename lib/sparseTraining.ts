@@ -18,12 +18,12 @@
 export type Matrix = number[][];
 export type Vec = number[];
 
-export const INPUT_DIM = 4;
-export const OUTPUT_DIM = 4;
+export const INPUT_DIM = 16;
+export const OUTPUT_DIM = 16;
 export const DATASET_SIZE = 64;
 export const BATCH_SIZE = 8;
 export const EPOCHS = 80;
-export const LR = 0.04;
+export const LR = 0.01;
 const BETA1 = 0.9;
 const BETA2 = 0.999;
 const ADAM_EPS = 1e-8;
@@ -31,7 +31,7 @@ const SEED = 17;
 export const SPARSE_DIM = 64;
 const SPARSE_ROUTING_SEED = 91;
 const SPARSE_L1 = 0.05;
-export const ACTIVE_COUNT = 16; // trainable cells per sparse layer
+export const ACTIVE_COUNT = 64; // trainable cells per sparse layer
 // Low-rank factorization W = A·B uses rank r → 2·dim·r params per layer.
 // Pick r so the low-rank param count is as close as possible to the sparse one.
 export const LOWRANK_R = Math.max(1, Math.round(ACTIVE_COUNT / (2 * SPARSE_DIM)));
