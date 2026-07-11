@@ -67,9 +67,15 @@ export default function Home() {
   }, [parsed, matA, matB, dimSizes]);
 
   return (
-    <div className="flex h-screen bg-gray-900 text-white">
+    <div className="flex h-screen overflow-hidden bg-gray-900 text-white">
       <div className="w-80 flex-shrink-0 p-4 space-y-6 overflow-y-auto border-r border-gray-700">
         <h1 className="text-xl font-bold">Matrix Multiply Viz</h1>
+        <a href="/nn" className="text-xs text-sky-400 hover:underline block">
+          → Autograd NN playground
+        </a>
+        <a href="/train" className="text-xs text-sky-400 hover:underline block">
+          → Matrix training with Adam
+        </a>
         <EinsumInput
           notation={notation}
           setNotation={setNotation}
