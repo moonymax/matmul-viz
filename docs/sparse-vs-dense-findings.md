@@ -319,6 +319,25 @@ D=2048, K=1% budget:
   *alignment* not just magnitude. Would tighten the bound and could make even
   exact-recall gating cheap. (next experiment)
 
+### 17. Sketch gate does NOT beat the norm gate — `cifar_sketch_gate.py`
+Tested the finding-16 idea: replace the magnitude-only norm gate with a
+random-projection sketch `Ghat = (P da)^T (P x)`, P: B->b' (b'=8/16/32), a rank-b'
+estimate of G capturing alignment at b' mults/cell. Real CIFAR D=2048. Result:
+**the sketch is strictly worse than the plain norm gate** at every layer (lower
+top-K recall; needs >20% of cells for 95% recall vs the norm gate's 5-18%). Why:
+- low-b' JL is too noisy (dot-product estimate error ~1/sqrt(b'), ~25% at b'=16)
+  -- the noise corrupts the ranking more than alignment info helps; de-noising
+  needs b'->B, defeating the purpose.
+- on the layers where a cheap gate works at all (deep, near rank-1 per finding
+  15), the norm gate is already near-OPTIMAL: for G = sigma*u(x)v,
+  `‖da[:,i]‖·‖x[:,j]‖ ∝ |u_i||v_j| = |G[i,j]|` exactly, so norm ranks cells
+  perfectly (recall 1.00 at 5% on b3.w2). No room for the sketch to add value;
+  it would only help on high-rank shallow layers, where b' is far too small.
+Conclusion: the norm gate (finding 16) is the best cheap gate. Magnitude bound is
+loose for *exact* top-K but excellent for ~95% recall on deep near-rank-1 layers
+(5-18x speedup). The cheapest gate already spends its 1 mult/cell optimally where
+gating is viable; the extra per-cell budget doesn't buy a better gate here.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
