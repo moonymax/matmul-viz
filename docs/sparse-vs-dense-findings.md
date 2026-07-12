@@ -367,6 +367,26 @@ that would actually move wall-clock: **structured/block sparsity** (coalesced), 
 far better sparse kernel, or accepting sparse wins only on accuracy-per-param
 (finding 6) and in memory-bound / non-GPU regimes — not MPS wall-clock.
 
+### 19. x-caching the sparse forward: 2.1x, confirms the DRAM-gather diagnosis — `sparse_metal.mm`
+Per the finding-18 diagnosis (the only random access is the input gather
+`x[b, csr_col[t]]`, and `x[b,:]` is small enough to cache on-chip), added an
+x-cached forward kernel: one threadgroup per batch element stages `x[b,:]` into
+threadgroup (SRAM) memory once, then grid-strides the output rows gathering from
+SRAM. Same step benchmark (Sd=4096, k=1M):
+
+| phase | dense-small | sparse before | sparse x-cached |
+|---|---|---|---|
+| fwd (ms) | 0.35 | 70.2 | **33.4** (2.1x) |
+| bwd (ms) | 0.35 | 385 | 298 (untouched) |
+| total (ms) | 1.43 | 458 | 335 |
+
+- **Forward 2.1x faster** — the DRAM random-gather was a real chunk, as predicted.
+  Still 95x dense (latency-bound serial row loop; likely shared-mem bank conflicts
+  on `xs[col]`; only B=256 threadgroups -> modest occupancy). More forward left.
+- **Backward now dominates (298 ms)** and was intentionally not touched: its
+  `grad_val` reads `x` *by column across the batch*, which per-batch-row caching
+  can't help -- that needs the transposed-layout representation change (next step).
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
