@@ -241,6 +241,19 @@ no-op on the isotropic synthetic problem and on post-nonlinearity activations. F
 the direction-not-magnitude case, LSH/IVF (approximate MIPS) would be the route.
 Not implemented — the synthetic testbed is its worst case; revisit on real data.
 
+### 13b. Real CIFAR activations have only a mild tail — `cifar_skew.py`
+Followed up on real data: dense ResFFN trained to 55.7%, column-norm skew per
+Linear layer over real CIFAR batches.
+- **Raw pixels (stem) and LayerNorm-fed layers (W1): uniform** (col max/median
+  1.2–1.7, top-K cells span ~98% of columns). LayerNorm *structurally* removes
+  column skew (normalizes each sample) → screening is dead on the LN path.
+- **GELU-fed layers (W2): a mild tail that grows with depth** — col max/median
+  2.0 → 3.6 by block 2; top-5% grad cells in ~145–200 of 256 columns (57–78%).
+  Worth maybe a ~1.5–2× column prune, not the ~10× of the power-law synthetic.
+Conclusion: CIFAR-MLP is a mild case; screening would help only the deeper GELU
+layers, modestly. The compelling regime remains large models with residual-stream
+"massive activations" (bigger D, stronger outlier channels).
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
