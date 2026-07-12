@@ -209,6 +209,38 @@ device-synced). Producing the grow signal for a D x D layer, batch B=32, on MPS:
   launches, avoid materializing the `p×D` strip) should turn the ops advantage
   into a wall-clock one even against the bare GEMM. (next work item)
 
+### 12. Fused Metal top-K selection kernel — `metal/topk_metal.{mm,py}`
+Profiling rowexact (`bench_rowexact_breakdown.py`) showed **67% of its wall-clock
+is `torch.topk` over the p×D strip** (521 µs); the matmuls are cheap (~5% each).
+So the fused kernel targets *selection*, not the matmuls. Built an approximate
+top-K on MPS (one command buffer, three chained kernels, no host round-trips):
+histogram of `|v|` by **float-bit magnitude** (for x≥0 the raw bits are monotone
+in value, so `bin = bits>>18` needs no max reduction) → one-thread scan for the
+threshold bin giving ≥K → atomic-append compaction, returning exactly K indices
+(so it pipelines like `topk`, no counter readback). **394 µs vs torch.topk 508 µs
+(1.3×), overlap@K 0.94, energy 0.98** — plenty for a grow heuristic. Tries that
+lost: separate submissions with host round-trips (0.6×); coarse `NB=1024` bins
+(overlap 0.58); threadgroup-local histogram (barrier overhead, slower). The win is
+modest because MPS is overhead-bound on these small ops; the bigger lever is
+upstream (screening, finding 13).
+
+### 13. MIPS screening is data-gated — useless on isotropic, big on heavy-tailed — `measure_column_skew.py`
+Grow-cell selection is maximum-inner-product search: `G[i,j]=⟨da[:,i],x[:,j]⟩`, so
+Cauchy–Schwarz (`|G[i,j]| ≤ ‖da[:,i]‖·‖x[:,j]‖`) lets you screen out low-norm
+columns exactly — **but only if column norms are heavy-tailed and the top-K cells
+concentrate in few rows/cols.** Measured (D=2048, B=32, K=9216):
+- **Isotropic input (our testbed): screening buys nothing.** Column-norm top-10%
+  share 0.12 (uniform=0.10), max/median 1.5; the true top-K cells spread over
+  ~1300–1700 of 2048 rows *and* columns. High-rank, diffuse, no tail to prune.
+- **Heavy-tailed input: dramatic at the input layer** — layer-1 top-K cells
+  collapse to **191 columns** (9% of D), col max/median 40×. But the skew dies at
+  the nonlinearity: layer-2 (input `tanh(pre1)`) is back to uniform.
+Conclusion: norm-based screening pays only on genuinely heavy-tailed, input-facing
+activations (real models have outlier channels — "massive activations"); it is a
+no-op on the isotropic synthetic problem and on post-nonlinearity activations. For
+the direction-not-magnitude case, LSH/IVF (approximate MIPS) would be the route.
+Not implemented — the synthetic testbed is its worst case; revisit on real data.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
