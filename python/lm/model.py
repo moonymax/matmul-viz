@@ -285,34 +285,40 @@ class SparseSwiGLU(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# FFN variant 3: MoE (DeepSeek-V3 style)
+# FFN variant 3: MoE (DeepSeek-V3 style) — BATCHED grouped-GEMM dispatch
 # --------------------------------------------------------------------------- #
-class Expert(nn.Module):
-    """Small bias-free SwiGLU expert."""
+def _moe_group(topi, gate_w, N, n_routed):
+    """Group the (N*top_k) token->expert assignments for a batched (bmm) dispatch.
 
-    def __init__(self, dim, hidden):
-        super().__init__()
-        self.gate = nn.Linear(dim, hidden, bias=False)
-        self.up = nn.Linear(dim, hidden, bias=False)
-        self.down = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x):
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+    Returns tok_sorted (which token each assignment belongs to, grouped by expert),
+    slot (its position in a padded [n_routed, cap] grid), cap (= max tokens routed
+    to any expert -> DROPLESS: every assignment fits, none dropped), w_sorted (the
+    gate weight per assignment) and counts (per-expert load). Padding slots that no
+    assignment maps to stay zero (silu(0)*0 @ W = 0) and are never scattered back."""
+    k = topi.shape[1]
+    flat_e = topi.reshape(-1)
+    flat_tok = torch.arange(N, device=topi.device).repeat_interleave(k)
+    counts = torch.bincount(flat_e, minlength=n_routed)
+    cap = int(counts.max().item())
+    order = torch.argsort(flat_e)                     # groups equal experts contiguously
+    e_sorted = flat_e[order]
+    tok_sorted = flat_tok[order]
+    offsets = counts.cumsum(0) - counts               # start index of each expert's block
+    rank = torch.arange(flat_e.numel(), device=topi.device) - offsets[e_sorted]
+    slot = e_sorted * cap + rank                      # position in the [n_routed*cap] grid
+    w_sorted = gate_w.reshape(-1)[order]
+    return tok_sorted, slot, cap, w_sorted, counts
 
 
 class MoEFFN(nn.Module):
-    """Fine-grained MoE FFN.
-
-    Recipe (DeepSeek-V3 / Qwen3-MoE / GLM-4.x consensus):
-      * many small routed experts + one (or more) always-on shared expert(s)
-      * top-k routing with a sigmoid gate; the top-k gate values are normalized
-        to sum to 1 and used as the mixing weights
-      * aux-loss-free load balancing: a per-expert routing *bias* (a buffer, no
-        gradient) is added to the gate scores *only for top-k selection* and is
-        nudged each training step toward balancing per-expert load
-        (bias += u * sign(mean_load - load_e)).
-      * a small classic switch-transformer aux load-balance loss is also exposed
-        via `self.last_aux_loss` (collected by the model, added by the trainer).
+    """Fine-grained MoE FFN (DeepSeek-V3 / Qwen3 / GLM / Kimi recipe):
+      * many small routed experts + always-on shared expert(s)
+      * top-k routing, sigmoid gate, top-k weights normalized to sum 1
+      * aux-loss-free load balancing via a per-expert routing bias buffer
+      * DROPLESS (no capacity factor); dispatch is a BATCHED grouped GEMM — expert
+        weights are stacked (n_routed, ., .) and applied with bmm over a padded
+        [n_routed, cap] token grid, so it runs on the matmul units instead of a
+        Python per-expert loop. cap = max per-expert load => nothing is dropped.
     """
 
     def __init__(self, cfg: GPTConfig):
@@ -323,57 +329,49 @@ class MoEFFN(nn.Module):
         self.top_k = cfg.moe_top_k
         self.aux_coef = cfg.moe_aux_coef
         self.bias_update = cfg.moe_bias_update
-
         he = cfg.moe_expert_hidden
+
         self.router = nn.Linear(C, self.n_routed, bias=False)
-        self.experts = nn.ModuleList([Expert(C, he) for _ in range(self.n_routed)])
-        self.shared = nn.ModuleList([Expert(C, he) for _ in range(self.n_shared)])
-        # aux-loss-free routing bias (persistent, not optimized)
+        self.Wg = nn.Parameter(torch.empty(self.n_routed, C, he))   # gate
+        self.Wu = nn.Parameter(torch.empty(self.n_routed, C, he))   # up
+        self.Wd = nn.Parameter(torch.empty(self.n_routed, he, C))   # down
+        self.Wsg = nn.Parameter(torch.empty(self.n_shared, C, he))  # shared gate
+        self.Wsu = nn.Parameter(torch.empty(self.n_shared, C, he))
+        self.Wsd = nn.Parameter(torch.empty(self.n_shared, he, C))
+        for w in (self.Wg, self.Wu, self.Wd, self.Wsg, self.Wsu, self.Wsd):
+            nn.init.normal_(w, mean=0.0, std=0.02)
         self.register_buffer("expert_bias", torch.zeros(self.n_routed))
         self.last_aux_loss = None
 
     def forward(self, x, token_ids=None):
         B, T, C = x.shape
-        xf = x.reshape(-1, C)          # (N, C)
+        xf = x.reshape(-1, C)
         N = xf.shape[0]
 
-        logits = self.router(xf)               # (N, n_routed)
-        scores = torch.sigmoid(logits)         # gate scores in (0, 1)
-
-        # --- top-k selection uses scores + bias; weights use raw scores ---
-        routing = scores + self.expert_bias    # buffer -> no grad through bias
-        _, topi = routing.topk(self.top_k, dim=-1)      # (N, k)
-        gate_w = torch.gather(scores, 1, topi)          # (N, k)
+        scores = torch.sigmoid(self.router(xf))                 # (N, n_routed)
+        routing = scores + self.expert_bias                     # bias: selection only
+        _, topi = routing.topk(self.top_k, dim=-1)
+        gate_w = torch.gather(scores, 1, topi)
         gate_w = gate_w / (gate_w.sum(-1, keepdim=True) + 1e-9)
 
-        out = torch.zeros_like(xf)
-        flat_i = topi.reshape(-1)                       # (N*k,)
-        flat_w = gate_w.reshape(-1)                     # (N*k,)
-        token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.top_k)
+        tok_sorted, slot, cap, w_sorted, counts = _moe_group(topi, gate_w, N, self.n_routed)
+        Xpad = xf.new_zeros(self.n_routed * cap, C)
+        Xpad[slot] = xf[tok_sorted]
+        Xpad = Xpad.view(self.n_routed, cap, C)
+        h = F.silu(torch.bmm(Xpad, self.Wg)) * torch.bmm(Xpad, self.Wu)   # (n_routed, cap, he)
+        o = torch.bmm(h, self.Wd).reshape(self.n_routed * cap, C)[slot]   # (M, C)
+        out = xf.new_zeros(N, C)
+        out.index_add_(0, tok_sorted, o * w_sorted.unsqueeze(-1))
 
-        # DROPLESS: every routed token is processed (no expert-capacity factor, no
-        # token dropping — unlike GShard/Switch). Imbalance only makes some experts
-        # do more work; the aux-loss-free bias below keeps load roughly balanced.
-        counts = torch.bincount(flat_i, minlength=self.n_routed).float()
-        for e in range(self.n_routed):
-            mask = flat_i == e
-            if bool(mask.any()):
-                sel = token_idx[mask]
-                eo = self.experts[e](xf[sel])
-                out.index_add_(0, sel, eo * flat_w[mask].unsqueeze(-1))
-
-        for sh in self.shared:
-            out = out + sh(xf)
+        for i in range(self.n_shared):                          # shared expert(s), all tokens
+            out = out + (F.silu(xf @ self.Wsg[i]) * (xf @ self.Wsu[i])) @ self.Wsd[i]
 
         if self.training:
-            # aux-loss-free balancing: nudge bias toward equal load
             with torch.no_grad():
-                load = counts / counts.sum().clamp(min=1.0)
-                mean_load = 1.0 / self.n_routed
-                self.expert_bias += self.bias_update * torch.sign(mean_load - load)
-            # classic (differentiable) switch aux loss, small coefficient
-            importance = scores.mean(0)                 # (n_routed,), differentiable
-            fraction = counts / max(N, 1)               # (n_routed,), constant
+                load = counts.float() / counts.sum().clamp(min=1.0)
+                self.expert_bias += self.bias_update * torch.sign(1.0 / self.n_routed - load)
+            importance = scores.mean(0)
+            fraction = counts.float() / max(N, 1)
             self.last_aux_loss = self.aux_coef * self.n_routed * (importance * fraction).sum()
         else:
             self.last_aux_loss = None
@@ -390,6 +388,9 @@ class MoEFFN(nn.Module):
 # with layer_emb shared across all experts (routed + shared).
 # --------------------------------------------------------------------------- #
 class MoEPLEFFN(nn.Module):
+    """MoE-PLE, batched grouped-GEMM (see MoEFFN). Experts SHARE one per-layer
+    token embedding as the up/value path; each has its own gate + down."""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         C = cfg.embed_dim
@@ -401,48 +402,50 @@ class MoEPLEFFN(nn.Module):
         self.bias_update = cfg.moe_bias_update
 
         self.router = nn.Linear(C, self.n_routed, bias=False)
-        self.layer_emb = nn.Embedding(cfg.vocab_size, H)          # shared value path
-        self.gate = nn.ModuleList([nn.Linear(C, H, bias=False) for _ in range(self.n_routed)])
-        self.down = nn.ModuleList([nn.Linear(H, C, bias=False) for _ in range(self.n_routed)])
-        self.shared_gate = nn.ModuleList([nn.Linear(C, H, bias=False) for _ in range(self.n_shared)])
-        self.shared_down = nn.ModuleList([nn.Linear(H, C, bias=False) for _ in range(self.n_shared)])
+        self.layer_emb = nn.Embedding(cfg.vocab_size, H)            # shared value path
+        self.Wg = nn.Parameter(torch.empty(self.n_routed, C, H))    # per-expert gate
+        self.Wd = nn.Parameter(torch.empty(self.n_routed, H, C))    # per-expert down
+        self.Wsg = nn.Parameter(torch.empty(self.n_shared, C, H))
+        self.Wsd = nn.Parameter(torch.empty(self.n_shared, H, C))
+        for w in (self.Wg, self.Wd, self.Wsg, self.Wsd):
+            nn.init.normal_(w, mean=0.0, std=0.02)
         self.register_buffer("expert_bias", torch.zeros(self.n_routed))
         self.last_aux_loss = None
 
     def forward(self, x, token_ids=None):
         B, T, C = x.shape
-        xf = x.reshape(-1, C)                       # (N, C)
-        emb = self.layer_emb(token_ids.reshape(-1))  # (N, H) shared up/value path
+        xf = x.reshape(-1, C)
+        emb = self.layer_emb(token_ids.reshape(-1))                 # (N, H) shared value
         N = xf.shape[0]
 
-        scores = torch.sigmoid(self.router(xf))            # (N, n_routed)
-        routing = scores + self.expert_bias               # bias: selection only, no grad
-        _, topi = routing.topk(self.top_k, dim=-1)         # (N, k)
+        scores = torch.sigmoid(self.router(xf))
+        routing = scores + self.expert_bias
+        _, topi = routing.topk(self.top_k, dim=-1)
         gate_w = torch.gather(scores, 1, topi)
         gate_w = gate_w / (gate_w.sum(-1, keepdim=True) + 1e-9)
 
-        out = torch.zeros_like(xf)
-        flat_i = topi.reshape(-1)
-        flat_w = gate_w.reshape(-1)
-        token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.top_k)
-        # DROPLESS (see MoEFFN): all routed tokens processed, no capacity factor.
-        counts = torch.bincount(flat_i, minlength=self.n_routed).float()
-        for e in range(self.n_routed):
-            mask = flat_i == e
-            if bool(mask.any()):
-                sel = token_idx[mask]
-                eo = self.down[e](F.silu(self.gate[e](xf[sel])) * emb[sel])
-                out.index_add_(0, sel, eo * flat_w[mask].unsqueeze(-1))
+        tok_sorted, slot, cap, w_sorted, counts = _moe_group(topi, gate_w, N, self.n_routed)
+        H = emb.shape[1]
+        Xpad = xf.new_zeros(self.n_routed * cap, C)
+        Epad = emb.new_zeros(self.n_routed * cap, H)
+        Xpad[slot] = xf[tok_sorted]
+        Epad[slot] = emb[tok_sorted]
+        Xpad = Xpad.view(self.n_routed, cap, C)
+        Epad = Epad.view(self.n_routed, cap, H)
+        h = F.silu(torch.bmm(Xpad, self.Wg)) * Epad                 # (n_routed, cap, H)
+        o = torch.bmm(h, self.Wd).reshape(self.n_routed * cap, C)[slot]
+        out = xf.new_zeros(N, C)
+        out.index_add_(0, tok_sorted, o * w_sorted.unsqueeze(-1))
 
-        for g, d in zip(self.shared_gate, self.shared_down):
-            out = out + d(F.silu(g(xf)) * emb)
+        for i in range(self.n_shared):
+            out = out + (F.silu(xf @ self.Wsg[i]) * emb) @ self.Wsd[i]
 
         if self.training:
             with torch.no_grad():
-                load = counts / counts.sum().clamp(min=1.0)
+                load = counts.float() / counts.sum().clamp(min=1.0)
                 self.expert_bias += self.bias_update * torch.sign(1.0 / self.n_routed - load)
             importance = scores.mean(0)
-            fraction = counts / max(N, 1)
+            fraction = counts.float() / max(N, 1)
             self.last_aux_loss = self.aux_coef * self.n_routed * (importance * fraction).sum()
         else:
             self.last_aux_loss = None

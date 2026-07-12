@@ -40,6 +40,26 @@ if HERE not in sys.path:
 
 from model import TinyGPT, GPTConfig, MoEFFN, MoEPLEFFN, SwiGLUPLE  # noqa: E402
 
+try:
+    from torch.utils.flop_counter import FlopCounterMode
+    _HAS_FLOP = True
+except Exception:  # pragma: no cover
+    _HAS_FLOP = False
+
+
+def measure_flops_fwd_per_token(model, x):
+    """Measured forward FLOPs per token (matmul/bmm/sdpa; MoE counts only the
+    activated experts since routing runs for real). Training step ~= 3x this."""
+    if not _HAS_FLOP:
+        return 0.0
+    was = model.training
+    model.eval()
+    fc = FlopCounterMode(display=False)
+    with torch.no_grad(), fc:
+        model(x)
+    model.train(was)
+    return fc.get_total_flops() / x.numel()
+
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 SEED = 1234
 
@@ -101,10 +121,10 @@ def active_params(cfg):
     inactive = 0
     for m in model.modules():
         if isinstance(m, MoEFFN):
-            per_expert = sum(p.numel() for p in m.experts[0].parameters())
+            per_expert = m.Wg[0].numel() + m.Wu[0].numel() + m.Wd[0].numel()
             inactive += (m.n_routed - m.top_k) * per_expert
         elif isinstance(m, MoEPLEFFN):
-            per_expert = sum(p.numel() for p in list(m.gate[0].parameters()) + list(m.down[0].parameters()))
+            per_expert = m.Wg[0].numel() + m.Wd[0].numel()
             inactive += (m.n_routed - m.top_k) * per_expert
             inactive += m.layer_emb.weight.numel() - m.layer_emb.weight.shape[1]
         elif isinstance(m, SwiGLUPLE):
@@ -235,6 +255,7 @@ def train_one(label, cfg, train, val, vocab_size):
     torch.manual_seed(SEED)
     model = TinyGPT(cfg).to(DEVICE)
     n_params = model.count_parameters()
+    flops_fwd = measure_flops_fwd_per_token(model, train[:BATCH].to(DEVICE)[:, :-1])
     opt = build_optimizer(model)
     sched = make_scheduler(opt, STEPS)
     it = batch_iter(train, BATCH, 42)
@@ -258,8 +279,10 @@ def train_one(label, cfg, train, val, vocab_size):
         if step % LOG_EVERY == 0 or step == 1:
             lv = eval_val(model, val, vocab_size)
             model.train()
-            tps = total_tokens / (time.time() - t0)
-            curve.append({"step": step, "train_loss": float(loss.item()), "val_loss": lv, "tok_s": tps})
+            elapsed = time.time() - t0
+            tps = total_tokens / elapsed
+            curve.append({"step": step, "train_loss": float(loss.item()), "val_loss": lv,
+                          "tok_s": tps, "elapsed_s": elapsed})
             print(f"  [{label:16s}] step {step:4d}/{STEPS}  train {loss.item():.4f}  "
                   f"val {lv:.4f}  aux {float(aux):.4f}  {tps:,.0f} tok/s", flush=True)
         if step % CKPT_EVERY == 0 or step == STEPS:
@@ -267,6 +290,7 @@ def train_one(label, cfg, train, val, vocab_size):
     wall = time.time() - t0
     return {"label": label, "ffn_type": cfg.ffn_type, "n_layers": cfg.n_layers,
             "n_params": n_params, "active_params": active_params(cfg), "config": cfg.to_dict(),
+            "flops_fwd_per_tok": flops_fwd, "train_flops": 3.0 * flops_fwd * total_tokens,
             "curve": curve, "final_val_loss": curve[-1]["val_loss"],
             "final_train_loss": curve[-1]["train_loss"],
             "wall_s": wall, "tok_s": total_tokens / wall, "peak_mem_gb": peak}
@@ -293,18 +317,25 @@ def main():
         results[label] = train_one(label, cfg, train, val, V)
         print("", flush=True)
 
-    print("=" * 108)
-    print(f"{'model':16s} {'ffn':8s} {'lyr':>3} {'active':>10} {'total':>11} {'val':>8} "
-          f"{'train':>8} {'tok/s':>9} {'wall_s':>8} {'mem_gb':>7}")
-    print("-" * 108)
+    print("=" * 118)
+    print(f"{'model':16s} {'lyr':>3} {'active':>10} {'total':>11} {'Gf/tok':>7} {'val':>7} "
+          f"{'wall_s':>7} {'tok/s':>8} {'mem':>5}")
+    print("-" * 118)
     for label, _, _ in CELLS:
         r = results[label]
-        print(f"{label:16s} {r['ffn_type']:8s} {r['n_layers']:>3} {r['active_params']:>10,} "
-              f"{r['n_params']:>11,} {r['final_val_loss']:>8.4f} {r['final_train_loss']:>8.4f} "
-              f"{r['tok_s']:>9,.0f} {r['wall_s']:>8.1f} {r['peak_mem_gb']:>7.2f}")
-    print("=" * 108)
-    best = min(results.values(), key=lambda r: r["final_val_loss"])
-    print(f"\nbest val loss: {best['label']} = {best['final_val_loss']:.4f}  (equal ACTIVE params)")
+        print(f"{label:16s} {r['n_layers']:>3} {r['active_params']:>10,} {r['n_params']:>11,} "
+              f"{r['flops_fwd_per_tok']/1e9:>7.3f} {r['final_val_loss']:>7.4f} "
+              f"{r['wall_s']:>7.1f} {r['tok_s']:>8,.0f} {r['peak_mem_gb']:>5.2f}")
+    print("=" * 118)
+    best_loss = min(results.values(), key=lambda r: r["final_val_loss"])
+    # fastest to reach the best model's loss within THIS run (loss reached per wall-second)
+    print(f"\nlowest loss : {best_loss['label']} = {best_loss['final_val_loss']:.4f} "
+          f"(wall {best_loss['wall_s']:.0f}s, {best_loss['n_params']:,} total params)")
+    print("loss vs wall-clock (final val / wall_s) — lower loss & lower time is better:")
+    for label, _, _ in sorted(CELLS, key=lambda c: results[c[0]]["final_val_loss"]):
+        r = results[label]
+        print(f"  {label:16s} val {r['final_val_loss']:.4f}  @ {r['wall_s']:6.1f}s  "
+              f"({r['flops_fwd_per_tok']/1e9:.3f} Gflop/tok fwd, {r['n_params']:,} total)")
 
     with open(OUT_JSON, "w") as f:
         json.dump({"active_budget": A, "exp": EXP, "steps": STEPS, "seq": SEQ,
