@@ -70,7 +70,11 @@ class GPTConfig:
     mtp_weight: float = 0.3         # weight of each auxiliary MTP head loss
 
     # --- FFN selection ---
-    ffn_type: str = "ple"           # {"ple","sparse","moe","dense","sparse_wide","block"}
+    ffn_type: str = "ple"           # {"ple","sparse","moe","moe_ple","dense","sparse_wide","block"}
+
+    # --- expansion knobs (H=embed_dim => "no expansion"; H=k*embed_dim => "expansion") ---
+    ple_hidden: int = 160           # SwiGLUPLE hidden (gate/layer_emb/down width)
+    moe_ple_hidden: int = 160       # MoE-PLE per-expert hidden (shared emb width)
 
     # --- "block" variant (moveable dense b x b blocks; grow-and-prune) ---
     block_hidden: int = 768         # SwiGLU hidden dim (wide)
@@ -112,7 +116,8 @@ class GPTConfig:
         return self.n_kv_heads * self.head_dim
 
     def validate(self):
-        assert self.ffn_type in ("ple", "sparse", "moe", "dense", "sparse_wide", "block"), \
+        assert self.ffn_type in ("ple", "sparse", "moe", "moe_ple", "dense",
+                                 "sparse_wide", "block"), \
             f"bad ffn_type {self.ffn_type}"
         assert self.attn_dim != self.embed_dim, (
             f"design constraint violated: n_heads*head_dim ({self.attn_dim}) "
@@ -241,12 +246,16 @@ class CausalSelfAttention(nn.Module):
 # FFN variant 1: SwiGLU + per-layer embedding (v3 baseline)
 # --------------------------------------------------------------------------- #
 class SwiGLUPLE(nn.Module):
+    """SwiGLU whose up/value path is a per-layer token embedding. Hidden dim H =
+    cfg.ple_hidden (H=embed_dim => no expansion; H=k*embed_dim => expansion)."""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         C = cfg.embed_dim
-        self.gate = nn.Linear(C, C)
-        self.layer_emb = nn.Embedding(cfg.vocab_size, C)
-        self.down = nn.Linear(C, C)
+        H = cfg.ple_hidden
+        self.gate = nn.Linear(C, H)
+        self.layer_emb = nn.Embedding(cfg.vocab_size, H)
+        self.down = nn.Linear(H, C)
 
     def forward(self, x, token_ids):
         return self.down(F.silu(self.gate(x)) * self.layer_emb(token_ids))
@@ -342,6 +351,9 @@ class MoEFFN(nn.Module):
         flat_w = gate_w.reshape(-1)                     # (N*k,)
         token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.top_k)
 
+        # DROPLESS: every routed token is processed (no expert-capacity factor, no
+        # token dropping — unlike GShard/Switch). Imbalance only makes some experts
+        # do more work; the aux-loss-free bias below keeps load roughly balanced.
         counts = torch.bincount(flat_i, minlength=self.n_routed).float()
         for e in range(self.n_routed):
             mask = flat_i == e
@@ -362,6 +374,75 @@ class MoEFFN(nn.Module):
             # classic (differentiable) switch aux loss, small coefficient
             importance = scores.mean(0)                 # (n_routed,), differentiable
             fraction = counts / max(N, 1)               # (n_routed,), constant
+            self.last_aux_loss = self.aux_coef * self.n_routed * (importance * fraction).sum()
+        else:
+            self.last_aux_loss = None
+
+        return out.reshape(B, T, C)
+
+
+# --------------------------------------------------------------------------- #
+# FFN variant 3b: MoE-PLE — DeepSeek-style routing (fine-grained routed experts +
+# always-on shared expert(s), normalized sigmoid gating, aux-loss-free bias load
+# balancing) but the experts SHARE one per-layer token embedding as the up/value
+# path; each expert has its OWN gate and OWN down projection. So an expert is
+#   down_e( silu(gate_e(x)) * layer_emb(token) )
+# with layer_emb shared across all experts (routed + shared).
+# --------------------------------------------------------------------------- #
+class MoEPLEFFN(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        C = cfg.embed_dim
+        H = cfg.moe_ple_hidden
+        self.n_routed = cfg.moe_n_routed
+        self.n_shared = cfg.moe_n_shared
+        self.top_k = cfg.moe_top_k
+        self.aux_coef = cfg.moe_aux_coef
+        self.bias_update = cfg.moe_bias_update
+
+        self.router = nn.Linear(C, self.n_routed, bias=False)
+        self.layer_emb = nn.Embedding(cfg.vocab_size, H)          # shared value path
+        self.gate = nn.ModuleList([nn.Linear(C, H, bias=False) for _ in range(self.n_routed)])
+        self.down = nn.ModuleList([nn.Linear(H, C, bias=False) for _ in range(self.n_routed)])
+        self.shared_gate = nn.ModuleList([nn.Linear(C, H, bias=False) for _ in range(self.n_shared)])
+        self.shared_down = nn.ModuleList([nn.Linear(H, C, bias=False) for _ in range(self.n_shared)])
+        self.register_buffer("expert_bias", torch.zeros(self.n_routed))
+        self.last_aux_loss = None
+
+    def forward(self, x, token_ids=None):
+        B, T, C = x.shape
+        xf = x.reshape(-1, C)                       # (N, C)
+        emb = self.layer_emb(token_ids.reshape(-1))  # (N, H) shared up/value path
+        N = xf.shape[0]
+
+        scores = torch.sigmoid(self.router(xf))            # (N, n_routed)
+        routing = scores + self.expert_bias               # bias: selection only, no grad
+        _, topi = routing.topk(self.top_k, dim=-1)         # (N, k)
+        gate_w = torch.gather(scores, 1, topi)
+        gate_w = gate_w / (gate_w.sum(-1, keepdim=True) + 1e-9)
+
+        out = torch.zeros_like(xf)
+        flat_i = topi.reshape(-1)
+        flat_w = gate_w.reshape(-1)
+        token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.top_k)
+        # DROPLESS (see MoEFFN): all routed tokens processed, no capacity factor.
+        counts = torch.bincount(flat_i, minlength=self.n_routed).float()
+        for e in range(self.n_routed):
+            mask = flat_i == e
+            if bool(mask.any()):
+                sel = token_idx[mask]
+                eo = self.down[e](F.silu(self.gate[e](xf[sel])) * emb[sel])
+                out.index_add_(0, sel, eo * flat_w[mask].unsqueeze(-1))
+
+        for g, d in zip(self.shared_gate, self.shared_down):
+            out = out + d(F.silu(g(xf)) * emb)
+
+        if self.training:
+            with torch.no_grad():
+                load = counts / counts.sum().clamp(min=1.0)
+                self.expert_bias += self.bias_update * torch.sign(1.0 / self.n_routed - load)
+            importance = scores.mean(0)
+            fraction = counts / max(N, 1)
             self.last_aux_loss = self.aux_coef * self.n_routed * (importance * fraction).sum()
         else:
             self.last_aux_loss = None
@@ -491,6 +572,8 @@ def build_ffn(cfg: GPTConfig) -> nn.Module:
         return SparseSwiGLU(cfg)
     if cfg.ffn_type == "moe":
         return MoEFFN(cfg)
+    if cfg.ffn_type == "moe_ple":
+        return MoEPLEFFN(cfg)
     if cfg.ffn_type == "dense":
         return DenseSwiGLU(cfg)
     if cfg.ffn_type == "sparse_wide":
