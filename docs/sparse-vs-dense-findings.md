@@ -254,6 +254,25 @@ Conclusion: CIFAR-MLP is a mild case; screening would help only the deeper GELU
 layers, modestly. The compelling regime remains large models with residual-stream
 "massive activations" (bigger D, stronger outlier channels).
 
+### 14. Sample-subset gradient: modest lever, high-rank sum resists it — `sample_select.py`, `cifar_sample_select.py`
+`G = da^T@x = sum_b da[b](x)x[b]` is a sum of per-sample rank-1 terms; can a few
+high-error samples reconstruct it (compute exact G from m<<B samples, m*D^2 ops)?
+Measured top-K overlap of the m-sample gradient vs the full-batch gradient.
+- **Isotropic synthetic: no.** Sample contributions near-uniform (top-32/256 =
+  18% vs 12.5% uniform); even m=B/2 recovers 0.28 of top-K; error-select ≈ random.
+  Structureless on the sample axis too (every sample equally hard).
+- **Real CIFAR (trained ResFFN): concentrated but still insufficient.** Top-32/512
+  samples hold ~21-30% of contribution energy (~5x uniform) -- genuinely
+  heavy-tailed per-sample errors. But m=64/512 (12.5%) recovers only ~0.39 of the
+  top-K grow cells; the largest cells come from the full-batch *sum*, not a few
+  dominant terms, so dropping samples loses them.
+- **Best cheap selector = contribution `‖da_b‖·‖x_b‖`**, ~2x better than random at
+  small m and better than error norm `‖da_b‖` alone.
+Conclusion: a real but modest lever (caps ~0.4 overlap by m=64), can't reach
+rowexact's 0.8-0.89 on its own. Same underlying obstacle as findings 9/13: the
+grow gradient is high-rank/diffuse, so no single cheap axis (rows, cols, or
+samples) reconstructs its top cells cheaply.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
