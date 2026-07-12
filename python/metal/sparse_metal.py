@@ -76,6 +76,23 @@ def build_index_structures(rows: Tensor, cols: Tensor, in_features: int, out_fea
     }
 
 
+# Toggles (mostly for benchmarking each optimization's contribution):
+#   SPARSE_METAL_FUSED_BWD=0  -> two separate command-buffer commits in backward
+#                                (isolates WIN 1: fused single-commit backward)
+#   SPARSE_METAL_TG_GRADVAL=1 -> threadgroup-reduction grad_val kernel (WIN 2)
+#
+# WIN 2 default is OFF: with this layer's large k (thousands of nonzeros) the
+# one-thread-per-nonzero serial grad_val already saturates the GPU, so the
+# threadgroup tree-reduction only adds barrier overhead and is measurably slower.
+# The tg kernel is kept for the small-k / very-large-batch regime where it wins.
+def _fused_bwd() -> bool:
+    return os.environ.get("SPARSE_METAL_FUSED_BWD", "1") != "0"
+
+
+def _tg_gradval() -> bool:
+    return os.environ.get("SPARSE_METAL_TG_GRADVAL", "0") != "0"
+
+
 class SparseLinearMetalFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, values, crow, csr_col, csr_rowidx,
@@ -94,13 +111,27 @@ class SparseLinearMetalFunction(torch.autograd.Function):
          ccol, csc_rowidx, csc_valperm) = ctx.saved_tensors
         ext = _ext()
         grad_out = grad_out.contiguous()
+        need_gv = ctx.needs_input_grad[1]
+        need_gx = ctx.needs_input_grad[0]
+        tg = _tg_gradval()
 
         grad_x = grad_values = None
-        if ctx.needs_input_grad[1]:
-            grad_values = ext.sparse_grad_val(grad_out, x, csr_rowidx, csr_col)
-        if ctx.needs_input_grad[0]:
-            grad_x = ext.sparse_grad_x(grad_out, values, ccol, csc_rowidx,
-                                       csc_valperm, ctx.in_features)
+        if _fused_bwd():
+            # WIN 1: both kernels in one command buffer, one commit, no wait.
+            gv, gx = ext.sparse_backward(
+                grad_out, x, values, csr_rowidx, csr_col,
+                ccol, csc_rowidx, csc_valperm, need_gv, need_gx, tg,
+            )
+            if need_gv:
+                grad_values = gv
+            if need_gx:
+                grad_x = gx
+        else:
+            if need_gv:
+                grad_values = ext.sparse_grad_val(grad_out, x, csr_rowidx, csr_col, tg)
+            if need_gx:
+                grad_x = ext.sparse_grad_x(grad_out, values, ccol, csc_rowidx,
+                                           csc_valperm, ctx.in_features)
 
         # line up with forward args
         return (grad_x, grad_values, None, None, None, None, None, None, None, None)
