@@ -185,6 +185,30 @@ p=192 gives selQ 0.95 / 0.89 / 0.80 at B=1 / 32 / 128, and its ops rise (the
 exact downstream. NOTE: wall-clock on MPS doesn't yet reflect the ops win
 (topk/gather overhead) — ops is the reported signal.
 
+### 11. Wall-clock: the real cost of exact grow is the top-K, not the matmul — `bench_rowexact.py`
+Benchmarked rowexact vs the full gradient at D=2048 (median of 100 reps, warmed,
+device-synced). Producing the grow signal for a D x D layer, batch B=32, on MPS:
+
+| method | ops | %full | wall-clock |
+|---|---|---|---|
+| full-grad (`daᵀx` matmul only) | 134M | 100% | **227 µs** |
+| full + select (matmul + top-K over `D²`) | 134M | 100% | **17,280 µs** |
+| rowexact96 | 10.5M | 7.8% | 795 µs |
+| rowexact192 | 16.8M | 12.5% | 1,361 µs |
+
+- **vs the bare `daᵀx` GEMM, rowexact is slower** (795 vs 227 µs) despite 13× fewer
+  ops — the GEMM is one maximally-optimized fused kernel, rowexact is many small
+  unfused ones (Gram, two topks, gather, 2nd matmul), so it is launch/overhead
+  bound. The ops win doesn't yet translate to wall-clock.
+- **vs the real grow pipeline (`full+select`), rowexact is ~22× faster.** To grow
+  you must *select* cells, and top-K over the full `D²`=4.2M-cell matrix costs
+  ~17 ms (dominant, ~constant in B). rowexact only sorts its `p×D`=197K-cell strip.
+- **The genuine bottleneck of exact grow is the top-K over `D²`, not the matmul —
+  and that is exactly what rowexact avoids.** CPU shows the same pattern.
+- Implication: a fused rowexact kernel (collapse the Gram/score/gather/2nd-matmul
+  launches, avoid materializing the `p×D` strip) should turn the ops advantage
+  into a wall-clock one even against the bare GEMM. (next work item)
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
