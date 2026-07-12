@@ -16,8 +16,7 @@ import torch.nn.functional as F
 
 from dynamic_sparse import (
     DynamicSparseLinear, ApproxDynamicSparseLinear,
-    enforce_masks, rigl_update, cosine_drop_fraction,
-    set_capture, approx_grow_prune, l1_penalty,
+    set_capture, rigl_update, cosine_drop_fraction, approx_grow_prune, l1_penalty,
 )
 
 D = 128
@@ -49,21 +48,20 @@ def train(kind, k, l1coef, X, Y):
         idx = torch.randint(0, SAMPLES, (BATCH,), generator=g)
         frac = cosine_drop_fraction(step, STEPS)
         probe = step % RIGL_EVERY == 0 and frac > 0
-        if kind == "approx" and probe:
+        if probe:
             set_capture(model, True)
         opt.zero_grad(set_to_none=True)
         loss = F.mse_loss(model(X[idx]), Y[idx])
         if l1coef:
             loss = loss + l1coef * l1_penalty(model)
         loss.backward()
-        if kind == "exact" and probe:
-            rigl_update(model, opt, frac)
-        if kind == "approx" and probe:
-            approx_grow_prune(model, opt, n_swap=max(1, round(frac * k)), topk=APPROX_TOPK)
+        if probe:
+            if kind == "exact":
+                rigl_update(model, opt, frac)
+            else:
+                approx_grow_prune(model, opt, n_swap=max(1, round(frac * k)), topk=APPROX_TOPK)
             set_capture(model, False)
         opt.step()
-        if kind == "exact":
-            enforce_masks(model)
     with torch.no_grad():
         return F.mse_loss(model(X), Y).item()
 

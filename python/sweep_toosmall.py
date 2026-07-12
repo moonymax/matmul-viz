@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dynamic_sparse import (
-    DynamicSparseLinear, enforce_masks, rigl_update, cosine_drop_fraction, l1_penalty,
+    DynamicSparseLinear, set_capture, rigl_update, cosine_drop_fraction, l1_penalty,
 )
 
 D = 128            # "too big" problem dimension (isotropic, full rank)
@@ -88,16 +88,18 @@ def run(model, X, Y, dynamic=False):
     for step in range(STEPS):
         idx = torch.randint(0, SAMPLES, (BATCH,), generator=g)
         frac = cosine_drop_fraction(step, STEPS)
+        probe = dynamic and step % RIGL_EVERY == 0 and frac > 0
+        if probe:
+            set_capture(model, True)
         opt.zero_grad(set_to_none=True)
         loss = F.mse_loss(model(X[idx]), Y[idx])
         if dynamic:
             loss = loss + L1_COEF * l1_penalty(model)
         loss.backward()
-        if dynamic and step % RIGL_EVERY == 0 and frac > 0:
+        if probe:
             rigl_update(model, opt, frac)
+            set_capture(model, False)
         opt.step()
-        if dynamic:
-            enforce_masks(model)
     with torch.no_grad():
         return F.mse_loss(model(X), Y).item()
 

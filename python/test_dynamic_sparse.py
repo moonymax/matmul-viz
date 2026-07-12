@@ -18,8 +18,7 @@ import torch.nn.functional as F
 from sparse_layer import SparseLinear
 from dynamic_sparse import (
     DynamicSparseLinear, ApproxDynamicSparseLinear,
-    enforce_masks, rigl_update, cosine_drop_fraction,
-    set_capture, approx_grow_prune,
+    set_capture, rigl_update, cosine_drop_fraction, approx_grow_prune,
 )
 
 APPROX_TOPK = 48        # top-p rows x top-q cols scored by the approximate probe
@@ -70,13 +69,9 @@ def teacher_fn():
 
 
 def n_params(m):
-    """Effective trainable params: a DynamicSparseLinear stores a masked *dense*
-    weight for the grow/prune probe, but only its `k` active entries count."""
-    dyn_ids = {id(mod.weight) for mod in m.modules() if isinstance(mod, DynamicSparseLinear)}
-    total = sum(int(mod.mask.sum().item()) for mod in m.modules()
-                if isinstance(mod, DynamicSparseLinear))
-    total += sum(p.numel() for p in m.parameters() if id(p) not in dyn_ids)
-    return total
+    """Effective trainable params: a dynamic-sparse layer stores exactly its `k`
+    active weights as `values`, so a plain parameter count is already correct."""
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
 def train(kind, X, Y):
@@ -90,19 +85,18 @@ def train(kind, X, Y):
         idx = torch.randint(0, Nn, (BATCH,), generator=g)
         frac = cosine_drop_fraction(step, STEPS)
         probe = step % RIGL_EVERY == 0 and frac > 0
-        if kind == "approx" and probe:
+        if probe:
             set_capture(model, True)
         opt.zero_grad(set_to_none=True)
         loss = F.mse_loss(model(X[idx]), Y[idx])
         loss.backward()
-        if kind == "dynamic" and probe:
-            rigl_update(model, opt, frac)
-        if kind == "approx" and probe:
-            approx_grow_prune(model, opt, n_swap=max(1, round(frac * K)), topk=APPROX_TOPK)
+        if probe:
+            if kind == "dynamic":
+                rigl_update(model, opt, frac)
+            else:
+                approx_grow_prune(model, opt, n_swap=max(1, round(frac * K)), topk=APPROX_TOPK)
             set_capture(model, False)
         opt.step()
-        if kind == "dynamic":
-            enforce_masks(model)
         if step % 100 == 0 or step == STEPS - 1:
             with torch.no_grad():
                 full = F.mse_loss(model(X), Y).item()
@@ -141,7 +135,7 @@ def main():
     d_approx = results["approx"][1]
     d_dense = results["dense"][1]
     print(f"\n  static (fixed mask)         : {d_static:.4f}")
-    print(f"  dynamic (exact, masked-dense): {d_dyn:.4f}   ({d_static/d_dyn:.2f}x better than static)")
+    print(f"  dynamic (exact, dense-grad probe): {d_dyn:.4f}   ({d_static/d_dyn:.2f}x better than static)")
     print(f"  approx (top-p x top-q, O(k)) : {d_approx:.4f}   ({d_static/d_approx:.2f}x better than static)")
     print(f"  approx vs exact grow: {abs(d_approx-d_dyn)/d_dyn*100:.0f}% apart "
           f"(does the cheap probe match the full-gradient one?)")

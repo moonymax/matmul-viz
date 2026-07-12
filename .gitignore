@@ -44,3 +44,7 @@ next-env.d.ts
 .venv/
 __pycache__/
 *.pyc
+
+# datasets / caches (do not commit)
+python/data/
+*.pt

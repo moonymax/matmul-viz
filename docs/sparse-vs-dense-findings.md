@@ -75,6 +75,116 @@ Measured on pure data MSE (penalty excluded — verified by decomposition):
   not L1. (Retune wd for real-scale models; wd≈1.0 is high because these are tiny
   synthetic nets.) L1 is disabled by default in `sweep_toosmall.py`.
 
+### 6. CIFAR-10 (real data): wider-but-sparse LOSES to dense — `cifar_sparse_vs_dense.py`
+First test on real data. A residual FFN (stem `Linear(3072→S)`, 4 residual blocks
+of two square `S×S` matrices with GELU + skip, head `S→10`), AdamW + weight decay,
+25 epochs. Dense fixes `S=256`; the sparse model holds **total** trainable params
+equal and sweeps density, solving for `S` at each (higher density → smaller `S`).
+Deadness pruning. Log: `docs/cifar-sweep-v1.log`.
+
+| model | S | density | params | best test |
+|---|---|---|---|---|
+| dense | 256 | 100% | 1,316,106 | **61.00%** |
+| sparse | 256 | 100% | 1,316,106 | 61.35%  (anchor ≈ dense ✓) |
+| sparse | 306 | 50% | 1,321,012 | 60.70% |
+| sparse | 348 | 25% | 1,318,582 | 59.75% |
+| sparse | 387 | 10% | 1,316,817 | 58.54% |
+| sparse | 405 | 5% | 1,318,283 | 57.87% |
+| sparse | 417 | 2% | 1,317,615 | 57.29% |
+
+**Result: monotonic — dense wins, sparser is strictly worse.** The opposite of the
+synthetic thesis.
+
+**Why it doesn't transfer (the decisive confound):** the dense input stem
+`Linear(3072→S)` dominates the budget and is *never* sparsified. As density drops
+and `S` grows to hold total params equal, the budget flows into the (growing) dense
+stem and **starves the sparse body** — the operator the thesis is actually about:
+
+| density | S | stem params | sparse **body** params |
+|---|---|---|---|
+| 100% | 256 | 786k (60%) | 524k (40%) |
+| 10% | 387 | 1.19M (90%) | 120k (9%) |
+| 2% | 417 | 1.28M (97%) | **28k (2%)** |
+
+So the sweep tested "a wider dense input projection with a progressively defunded
+body," not "a wider sparse operator." The synthetic experiments had no such stem
+(the `D×D` matrices *were* the whole model), which is exactly why the thesis held
+there. **The fair analogue on CIFAR requires sparsifying the stem too** (a
+full-width end-to-end sparse network), so widening doesn't cannibalize the body —
+not yet run.
+
+### 7. Sparse layer made genuinely O(k) — `dynamic_sparse.py` (rewrite)
+The exact `DynamicSparseLinear` was "masked-dense": full `S×S` forward/backward,
+paying dense cost to get the inactive-cell gradient for free. Rewritten so both
+layers share sparse (values/rows/cols) storage and an O(B·k) gather-mul-scatter
+forward/backward. The exact grow signal is now reconstructed **separately** on
+probe steps as the outer product `G = daᵀ·x` from the captured error `da` and
+input `x` — an `(out×in)` materialization, but only every ΔT steps, not on every
+forward. Reproduces the pre-rewrite numbers (dynamic 0.164 vs static 0.204).
+
+### 8. Grow-and-prune frequency is a dominant knob — `sweep_probe_interval.py`
+How often we grow-and-prune (ΔT) drives most of the benefit. On the D=128 too-big
+teacher (10% density), exact grow: probing every 500 steps beats static by only
+−12%, every 100 by −31%, every 10 by **−49%** (sweet spot ~every 5–10; every-1
+slightly *worse* — over-churn). It's really total connection turnover (each probe
+swaps `frac·k`). Approx tracks the same curve ~8–11% behind exact at every
+interval. Consequence: the CIFAR v1 sweep (ΔT=100) badly under-probed the sparse
+models.
+
+### 9. Approx grow gradient is only faithful at small batch — `probe_approx_quality.py`
+Direct MSE of the approximate grow gradient vs the dense gradient `G = daᵀ·x`
+(relative MSE = fraction of gradient energy missed), grow/prune fixed at every 5,
+D=128, 10% density, top-p×top-q block p=q=48, swept over **batch size**:
+
+| batch | approx relMSE | oracle relMSE (same budget) | selection gap |
+|---|---|---|---|
+| 1 | 0.261 | 0.212 | 0.048 |
+| 8 | 0.602 | 0.335 | 0.267 |
+| 32 | 0.678 | 0.355 | 0.323 |
+| 128 | 0.711 | 0.361 | 0.350 |
+| 1024 | 0.738 | 0.362 | 0.376 |
+
+**The approximation degrades monotonically with batch size** — captures ~74% of
+gradient energy at B=1 but misses ~71% at B=128. The oracle (best possible
+p·q-cell keep) barely moves (0.21→0.36, a mild coverage effect), so the collapse
+is almost entirely **selection error**: the gap approx−oracle blows up 0.05→0.38.
+
+**Why:** `G = Σ_b da_b ⊗ x_b` is a sum of B rank-1 terms. At B=1 it's exactly
+rank-1 so `|G[i,j]| = |da_i|·|x_j|` and top-norm rows×cols *are* the largest
+entries (norm-ranking optimal). As B grows, large entries come from cross-batch
+**correlation** between `da[:,i]` and `x[:,j]`, which per-row/col norms are blind
+to. Fixing the approximation at real batch sizes means replacing norm-ranking with
+a rank-aware (alignment-aware) selector — the open work item.
+
+### 10. Efficient rank-aware grow gradient at scale — `approx_strategies.py`
+Chasing finding 9's fix: at large D (2048) with a fixed candidate budget, measure
+each method's **selection quality** = energy captured / *oracle* energy at the same
+budget (isolates selection from the coverage term, which otherwise dominates: at
+D=2048 a 9216-cell budget is 0.22% of the matrix, so oracle itself keeps only
+~3% of total energy). Ops tracked as % of the full gradient (`D²·B`).
+
+Two failed selectors and the fix (B=32, D=2048, budget 9216 cells):
+- **norm** (top rows by `‖da_i‖²` × top cols by `‖x_j‖²`, keep block): selQ **0.21**
+  at 0.3% ops. Cheap but the block's row×col product structure can't cover the
+  scattered large entries of a high-rank gradient.
+- **gram** (same block, rows/cols by *exact* grad-row/col norm): selQ 0.25 — the
+  block structure, not the scoring, was the limit. Dominated (6.5% ops, no gain).
+- **svd** (scattered union of top-singular-direction blocks): also ~no better;
+  the largest entries of a sum of B rank-1 terms aren't captured by individual
+  singular directions.
+- **rowexact** (top-p rows by exact grad-row norm, compute *those rows exactly
+  over ALL columns*, keep the true top cells — scattered, no column restriction):
+  selQ **0.80 at p=96 (7.8% ops)**, **0.89 at p=192 (12.5% ops)**. This is the win.
+  Cost `O(B²D + pBD)` — cheaper than the `O(D²B)` full gradient only for B≪D
+  (i.e. only at scale, which is the regime that matters).
+
+Scaling: rowexact degrades with batch (higher rank ⇒ need more exact rows):
+p=192 gives selQ 0.95 / 0.89 / 0.80 at B=1 / 32 / 128, and its ops rise (the
+`B²·D` gram row-scoring term). Open items: (a) cheaper row selector to cut the
+`B²·D` term at large batch; (b) confirm rowexact grow *decisions* train as well as
+exact downstream. NOTE: wall-clock on MPS doesn't yet reflect the ops win
+(topk/gather overhead) — ops is the reported signal.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when

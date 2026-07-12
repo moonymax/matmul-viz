@@ -29,8 +29,7 @@ import torch.nn.functional as F
 from sparse_layer import SparseLinear
 from dynamic_sparse import (
     DynamicSparseLinear, ApproxDynamicSparseLinear,
-    enforce_masks, rigl_update, cosine_drop_fraction,
-    set_capture, approx_grow_prune,
+    set_capture, rigl_update, cosine_drop_fraction, approx_grow_prune,
 )
 
 D_SMALL = 64
@@ -82,11 +81,9 @@ def make_big_layer(kind, gen):
 
 
 def n_params(m):
-    dyn = {id(mod.weight) for mod in m.modules() if isinstance(mod, DynamicSparseLinear)}
-    tot = sum(int(mod.mask.sum()) for mod in m.modules() if isinstance(mod, DynamicSparseLinear))
-    tot += sum(p.numel() for p in m.parameters() if id(p) not in dyn)
-    # frozen U is a buffer, not counted
-    return tot
+    # dynamic-sparse layers store exactly their k active weights as `values`;
+    # frozen U is a buffer, so a plain trainable-parameter count is correct.
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
 def build(kind, U, gen):
@@ -104,18 +101,17 @@ def train(kind, U, X, Y):
         idx = torch.randint(0, SAMPLES, (BATCH,), generator=g)
         frac = cosine_drop_fraction(step, STEPS)
         probe = step % RIGL_EVERY == 0 and frac > 0
-        if kind == "big_approx" and probe:
+        if probe:
             set_capture(model, True)
         opt.zero_grad(set_to_none=True)
         F.mse_loss(model(X[idx]), Y[idx]).backward()
-        if kind == "big_dynamic" and probe:
-            rigl_update(model, opt, frac)
-        if kind == "big_approx" and probe:
-            approx_grow_prune(model, opt, n_swap=max(1, round(frac * K)), topk=APPROX_TOPK)
+        if probe:
+            if kind == "big_dynamic":
+                rigl_update(model, opt, frac)
+            elif kind == "big_approx":
+                approx_grow_prune(model, opt, n_swap=max(1, round(frac * K)), topk=APPROX_TOPK)
             set_capture(model, False)
         opt.step()
-        if kind == "big_dynamic":
-            enforce_masks(model)
     with torch.no_grad():
         return model, F.mse_loss(model(X), Y).item()
 

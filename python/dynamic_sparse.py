@@ -1,17 +1,25 @@
-"""RigL-style dynamic sparse linear layer: grow-and-prune during training.
+"""RigL-style dynamic sparse linear layers: grow-and-prune during training.
 
-Keeps a fixed number `k` of active weights, but the *positions* migrate:
-periodically we prune the smallest-magnitude active weights and grow the
-largest-gradient inactive ones (from zero). This is the PyTorch analogue of the
-grow-and-prune we did in the JS demo.
+Both layers keep a fixed number `k` of active weights whose *positions* migrate:
+periodically we prune the "deadest" active weights (small |value| AND stable —
+small momentum AND small gradient) and grow new ones from zero at the positions
+with the largest gradient.
 
-Implementation note: this is "masked dense" — we store a full dense weight with
-inactive entries pinned to 0. That makes the forward identical to a true sparse
-op (zeros contribute nothing), while `weight.grad` stays *dense* so we can read
-the gradient at inactive positions — which is exactly the grow signal RigL needs
-(you can't get it from an O(k) sparse kernel without a periodic dense probe).
-For real efficiency you'd pay that dense-gradient probe only every ΔT steps and
-run the O(k) kernel otherwise; here (small synthetic models) we keep it simple.
+Storage is genuinely sparse (values / rows / cols) and the forward + backward are
+the O(B*k) gather-mul-scatter (`SparseLinearFunction`) — NO dense out x in matrix
+is ever formed for the forward/backward. The only difference between the two
+layers is how they find the *grow* positions (the gradient at inactive cells):
+
+  * `DynamicSparseLinear` (exact): on a probe step, reconstruct the full dense
+    weight gradient as the outer product  G = da^T @ x  (from the captured
+    output-gradient `da` and layer input `x`) and grow the top-|G| inactive
+    cells. This IS an (out x in) materialization — but it is computed SEPARATELY
+    from the forward and only every few steps, so it is not paid on every
+    forward/backward the way a masked-dense layer would.
+  * `ApproxDynamicSparseLinear`: never forms G at all — approximates it from the
+    top-p error rows x top-q activation columns (a tiny p x q matmul).
+
+Both capture `x` and `da` (via a tensor hook) only on probe steps.
 """
 
 from __future__ import annotations
@@ -20,22 +28,21 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from sparse_layer import SparseLinearFunction
 
 
+# --------------------------------------------------------------------------- #
+# penalties (operate on the k active weights of every dynamic-sparse layer)
+# --------------------------------------------------------------------------- #
 def l1_penalty(model: "nn.Module"):
-    """Sum |active weights| over sparse layers — add lambda*this to the training
-    loss so active weights are pushed toward 0, giving grow-and-prune genuinely
-    near-zero (safe-to-prune) candidates."""
+    """Sum |active weights| over sparse layers — add lambda*this to the loss to
+    push active weights toward 0 (giving grow-and-prune near-zero candidates)."""
     total = None
     for m in model.modules():
-        if isinstance(m, DynamicSparseLinear):
-            t = (m.weight * m.mask).abs().sum()
-        elif isinstance(m, ApproxDynamicSparseLinear):
+        if isinstance(m, _DynamicSparseBase):
             t = m.values.abs().sum()
-        else:
-            continue
-        total = t if total is None else total + t
+            total = t if total is None else total + t
     return total
 
 
@@ -43,13 +50,9 @@ def l2_penalty(model: "nn.Module"):
     """Sum of squared active weights over sparse layers (for an L2 loss term)."""
     total = None
     for m in model.modules():
-        if isinstance(m, DynamicSparseLinear):
-            t = (m.weight * m.mask).pow(2).sum()
-        elif isinstance(m, ApproxDynamicSparseLinear):
+        if isinstance(m, _DynamicSparseBase):
             t = m.values.pow(2).sum()
-        else:
-            continue
-        total = t if total is None else total + t
+            total = t if total is None else total + t
     return total
 
 
@@ -70,90 +73,12 @@ def _deadness(w_abs, m_abs, g_abs):
     return norm(w_abs) + norm(m_abs) + norm(g_abs)
 
 
-class DynamicSparseLinear(nn.Module):
+# --------------------------------------------------------------------------- #
+# shared base: sparse storage + O(k) forward + probe capture + deadness prune
+# --------------------------------------------------------------------------- #
+class _DynamicSparseBase(nn.Module):
     def __init__(self, in_features, out_features, k, *, init_scale=None, generator=None):
         super().__init__()
-        n = in_features * out_features
-        assert 1 <= k <= n
-        self.in_features = in_features
-        self.out_features = out_features
-        self.k = k
-
-        scale = init_scale if init_scale is not None else math.sqrt(out_features / k)
-        flat_mask = torch.zeros(n)
-        flat_mask[torch.randperm(n, generator=generator)[:k]] = 1.0
-        mask = flat_mask.view(out_features, in_features)
-        w = torch.randn(out_features, in_features, generator=generator) * scale * mask
-        self.weight = nn.Parameter(w)
-        self.register_buffer("mask", mask)
-
-    def forward(self, x):
-        return F.linear(x, self.weight)  # inactive entries are 0
-
-    @torch.no_grad()
-    def enforce_mask(self):
-        """Re-pin inactive weights to 0 (Adam nudges them; keep them off)."""
-        self.weight.mul_(self.mask)
-
-    @torch.no_grad()
-    def rigl_step(self, optimizer, drop_fraction: float) -> int:
-        """Prune smallest-|w| active weights, grow largest-|grad| inactive ones.
-        Uses the dense weight.grad from the most recent backward. Keeps k fixed
-        and resets Adam moments at the swapped positions. Returns #swapped."""
-        g = self.weight.grad
-        if g is None:
-            return 0
-        mask_flat = self.mask.view(-1)
-        w_flat = self.weight.data.view(-1)
-        g_flat = g.reshape(-1)
-
-        active = mask_flat.nonzero(as_tuple=False).view(-1)
-        inactive = (mask_flat == 0).nonzero(as_tuple=False).view(-1)
-        n_swap = max(1, int(round(drop_fraction * self.k)))
-        n_swap = min(n_swap, active.numel(), inactive.numel())
-        if n_swap == 0:
-            return 0
-
-        # prune the most "dead" active weights: small |w| AND stable (small
-        # momentum |m| AND small gradient |g|). Never prune an actively-moving one.
-        dead = _deadness(w_flat[active].abs(),
-                         _momentum(optimizer, self.weight, active),
-                         g_flat[active].abs())
-        drop = active[torch.topk(dead, n_swap, largest=False).indices]
-        grow = inactive[torch.topk(g_flat[inactive].abs(), n_swap, largest=True).indices]
-
-        mask_flat[drop] = 0.0
-        w_flat[drop] = 0.0
-        mask_flat[grow] = 1.0
-        w_flat[grow] = 0.0  # grow from zero -> output unchanged at the swap
-
-        st = optimizer.state.get(self.weight, None)
-        if st:
-            for key in ("exp_avg", "exp_avg_sq"):
-                if key in st:
-                    b = st[key].view(-1)
-                    b[drop] = 0.0
-                    b[grow] = 0.0
-        return n_swap
-
-
-class ApproxDynamicSparseLinear(nn.Module):
-    """Dynamic sparse layer that NEVER forms the n*n gradient.
-
-    Stores only k weights (`values`) at positions (`rows`,`cols`) and runs the
-    O(k) gather forward/backward. Grow-and-prune uses the POC approximation:
-    the batch gradient gW = sum_t da_t (x) inp_t is large where an output row
-    (error) AND an input column (activation) are both large, so we score only
-    the top-p error rows x top-q input columns (a tiny p*q matmul) and grow the
-    best inactive cell(s). Prune = smallest-|value| active weights. The layer's
-    input `x` and its output-gradient `da` are captured (only on probe steps)
-    via a tensor hook; no full gradient is ever materialized.
-    """
-
-    def __init__(self, in_features, out_features, k, *, init_scale=None, generator=None):
-        super().__init__()
-        from sparse_layer import SparseLinearFunction
-        self._fn = SparseLinearFunction
         n = in_features * out_features
         assert 1 <= k <= n
         self.in_features = in_features
@@ -171,7 +96,7 @@ class ApproxDynamicSparseLinear(nn.Module):
     def forward(self, x):
         if self._capture:
             self._x = x.detach()
-        out = self._fn.apply(x, self.values, self.rows, self.cols, self.out_features)
+        out = SparseLinearFunction.apply(x, self.values, self.rows, self.cols, self.out_features)
         if self._capture and out.requires_grad:
             out.register_hook(self._save_da)
         return out
@@ -180,44 +105,27 @@ class ApproxDynamicSparseLinear(nn.Module):
         self._da = g.detach()
         return None
 
-    @torch.no_grad()
-    def grow_prune(self, optimizer, n_swap: int, topk: int) -> int:
-        if self._x is None or self._da is None or n_swap <= 0:
-            return 0
-        x, da = self._x, self._da            # (tokens, in), (tokens, out)
-        in_f, out_f = self.in_features, self.out_features
-        p, q = min(topk, out_f), min(topk, in_f)
-        topR = torch.topk(da.pow(2).sum(0), p).indices          # top error rows (outputs)
-        topC = torch.topk(x.pow(2).sum(0), q).indices           # top activation cols (inputs)
-        scores = (da[:, topR].t() @ x[:, topC]).abs()           # (p, q) approx |gW| at candidates
-        cand_flat = (topR.view(-1, 1) * in_f + topC.view(1, -1)).reshape(-1)
-        cand_score = scores.reshape(-1)
+    def _active_flat(self):
+        return self.rows.long() * self.in_features + self.cols.long()
 
-        active_set = set((self.rows * in_f + self.cols).tolist())
-        grow, seen = [], set()
-        for ci in torch.argsort(cand_score, descending=True).tolist():
-            f = int(cand_flat[ci])
-            if f in active_set or f in seen:
-                continue
-            seen.add(f)
-            grow.append(f)
-            if len(grow) >= n_swap:
-                break
-        if not grow:
+    @torch.no_grad()
+    def _commit_swap(self, grow_flat, optimizer) -> int:
+        """Prune `len(grow_flat)` deadest active slots (small |value| AND stable:
+        small momentum AND small |grad|), move them to the new flat positions,
+        and reset value + Adam moments there. grad at active cells is
+        `self.values.grad` (already computed by the O(k) backward)."""
+        m = len(grow_flat)
+        if m == 0:
             return 0
-        m = len(grow)
-        # prune the most "dead" active weights: small |value| AND stable (small
-        # momentum AND small gradient). grad at active cells is self.values.grad
-        # (the O(k) sparse backward already computed it) — no full gradient.
         gval = self.values.grad.abs() if self.values.grad is not None \
             else torch.zeros_like(self.values)
         slots = torch.arange(self.k, device=self.values.device)
         dead = _deadness(self.values.abs(), _momentum(optimizer, self.values, slots), gval)
         prune_slots = torch.topk(dead, m, largest=False).indices
-        grow_t = torch.tensor(grow, dtype=torch.long)
-        self.rows[prune_slots] = grow_t // in_f
-        self.cols[prune_slots] = grow_t % in_f
-        self.values.data[prune_slots] = 0.0
+        grow_t = torch.as_tensor(grow_flat, dtype=torch.long, device=self.values.device)
+        self.rows[prune_slots] = grow_t // self.in_features
+        self.cols[prune_slots] = grow_t % self.in_features
+        self.values.data[prune_slots] = 0.0            # grow from zero -> output unchanged
         st = optimizer.state.get(self.values, None)
         if st:
             for key in ("exp_avg", "exp_avg_sq"):
@@ -227,36 +135,95 @@ class ApproxDynamicSparseLinear(nn.Module):
         return m
 
 
+class DynamicSparseLinear(_DynamicSparseBase):
+    """Exact grow signal via a periodic dense-gradient probe: on probe steps the
+    full weight gradient G = da^T @ x is reconstructed from the captured error and
+    input (computed separately from the forward, NOT via a dense forward)."""
+
+    @torch.no_grad()
+    def grow_prune(self, optimizer, n_swap: int, topk=None) -> int:
+        if self._x is None or self._da is None or n_swap <= 0:
+            return 0
+        n = self.in_features * self.out_features
+        n_swap = min(n_swap, self.k, n - self.k)
+        if n_swap <= 0:
+            return 0
+        # exact dense weight gradient, materialized only here (once per probe):
+        #   G[i, j] = sum_b da[b, i] * x[b, j]   -> flat idx  i*in + j
+        G = (self._da.t() @ self._x).abs().reshape(-1)   # (out*in,)
+        G[self._active_flat()] = -1.0                    # exclude active cells
+        grow = torch.topk(G, n_swap, largest=True).indices.tolist()
+        return self._commit_swap(grow, optimizer)
+
+
+class ApproxDynamicSparseLinear(_DynamicSparseBase):
+    """Approximate grow signal — never forms the (out x in) gradient. The batch
+    gradient is large where an output row (error) AND an input column
+    (activation) are both large, so we score only the top-p error rows x top-q
+    input columns (a tiny p*q matmul) and grow the best inactive cell(s)."""
+
+    @torch.no_grad()
+    def grow_prune(self, optimizer, n_swap: int, topk: int) -> int:
+        if self._x is None or self._da is None or n_swap <= 0:
+            return 0
+        x, da = self._x, self._da                        # (B, in), (B, out)
+        in_f, out_f = self.in_features, self.out_features
+        p, q = min(topk, out_f), min(topk, in_f)
+        topR = torch.topk(da.pow(2).sum(0), p).indices           # top error rows
+        topC = torch.topk(x.pow(2).sum(0), q).indices            # top activation cols
+        scores = (da[:, topR].t() @ x[:, topC]).abs()            # (p, q) approx |gW|
+        cand_flat = (topR.view(-1, 1) * in_f + topC.view(1, -1)).reshape(-1)
+        cand_score = scores.reshape(-1)
+
+        active = set(self._active_flat().tolist())
+        grow, seen = [], set()
+        for ci in torch.argsort(cand_score, descending=True).tolist():
+            f = int(cand_flat[ci])
+            if f in active or f in seen:
+                continue
+            seen.add(f)
+            grow.append(f)
+            if len(grow) >= n_swap:
+                break
+        return self._commit_swap(grow, optimizer)
+
+
 # --------------------------------------------------------------------------- #
 # training-loop helpers
 # --------------------------------------------------------------------------- #
 def set_capture(model: nn.Module, on: bool):
+    """Turn probe-step capture (of x and da) on/off for every dynamic layer."""
     for m in model.modules():
-        if isinstance(m, ApproxDynamicSparseLinear):
+        if isinstance(m, _DynamicSparseBase):
             m._capture = on
             if not on:
                 m._x = m._da = None
 
 
-def approx_grow_prune(model: nn.Module, optimizer, n_swap: int, topk: int) -> int:
+def rigl_update(model: nn.Module, optimizer, drop_fraction: float, topk: int = 48) -> int:
+    """Grow-and-prune every dynamic layer (exact or approx). Requires that this
+    step's forward/backward ran under set_capture(model, True). n_swap is scaled
+    per layer by its own k."""
     total = 0
     for m in model.modules():
-        if isinstance(m, ApproxDynamicSparseLinear):
-            total += m.grow_prune(optimizer, n_swap, topk)
+        if isinstance(m, _DynamicSparseBase):
+            n_swap = max(1, round(drop_fraction * m.k))
+            total += m.grow_prune(optimizer, n_swap, topk=topk)
     return total
+
+
+def approx_grow_prune(model: nn.Module, optimizer, n_swap: int, topk: int) -> int:
+    """Grow-and-prune with a fixed n_swap across layers (back-compat helper)."""
+    total = 0
+    for m in model.modules():
+        if isinstance(m, _DynamicSparseBase):
+            total += m.grow_prune(optimizer, n_swap, topk=topk)
+    return total
+
 
 def enforce_masks(model: nn.Module):
-    for m in model.modules():
-        if isinstance(m, DynamicSparseLinear):
-            m.enforce_mask()
-
-
-def rigl_update(model: nn.Module, optimizer, drop_fraction: float) -> int:
-    total = 0
-    for m in model.modules():
-        if isinstance(m, DynamicSparseLinear):
-            total += m.rigl_step(optimizer, drop_fraction)
-    return total
+    """No-op: sparse storage has no dense weight to re-pin (kept for API compat)."""
+    return None
 
 
 def cosine_drop_fraction(step: int, total_steps: int, alpha: float = 0.3,

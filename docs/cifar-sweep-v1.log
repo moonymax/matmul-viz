@@ -1,0 +1,219 @@
+device=mps  dense width D=256  blocks=4  epochs=25  batch=256  lr=0.001  wd=0.05
+
+parameter budget (dense baseline): 1,316,106
+
+>> DENSE baseline
+   S=256  trainable params=1,316,106
+    [dense S=256] epoch  1/25  test 40.91%  (best 40.91%)    5.7s
+    [dense S=256] epoch  2/25  test 45.95%  (best 45.95%)    7.2s
+    [dense S=256] epoch  3/25  test 47.46%  (best 47.46%)    8.8s
+    [dense S=256] epoch  4/25  test 50.26%  (best 50.26%)   10.6s
+    [dense S=256] epoch  5/25  test 51.81%  (best 51.81%)   12.4s
+    [dense S=256] epoch  6/25  test 52.77%  (best 52.77%)   14.0s
+    [dense S=256] epoch  7/25  test 53.40%  (best 53.40%)   15.8s
+    [dense S=256] epoch  8/25  test 53.71%  (best 53.71%)   17.5s
+    [dense S=256] epoch  9/25  test 54.53%  (best 54.53%)   19.1s
+    [dense S=256] epoch 10/25  test 54.71%  (best 54.71%)   21.0s
+    [dense S=256] epoch 11/25  test 56.15%  (best 56.15%)   22.6s
+    [dense S=256] epoch 12/25  test 56.66%  (best 56.66%)   24.4s
+    [dense S=256] epoch 13/25  test 57.28%  (best 57.28%)   26.1s
+    [dense S=256] epoch 14/25  test 57.52%  (best 57.52%)   27.9s
+    [dense S=256] epoch 15/25  test 58.02%  (best 58.02%)   29.6s
+    [dense S=256] epoch 16/25  test 58.14%  (best 58.14%)   31.3s
+    [dense S=256] epoch 17/25  test 58.84%  (best 58.84%)   33.1s
+    [dense S=256] epoch 18/25  test 59.45%  (best 59.45%)   34.8s
+    [dense S=256] epoch 19/25  test 60.22%  (best 60.22%)   36.4s
+    [dense S=256] epoch 20/25  test 60.16%  (best 60.22%)   38.3s
+    [dense S=256] epoch 21/25  test 60.36%  (best 60.36%)   40.1s
+    [dense S=256] epoch 22/25  test 60.54%  (best 60.54%)   42.0s
+    [dense S=256] epoch 23/25  test 61.00%  (best 61.00%)   43.5s
+    [dense S=256] epoch 24/25  test 60.98%  (best 61.00%)   45.2s
+    [dense S=256] epoch 25/25  test 60.98%  (best 61.00%)   47.0s
+   -> best test 61.00%
+
+>> SPARSE density=100%  solved S=256
+   S=256  density=100%  trainable params=1,316,106  (dense-equiv 524,288)
+    [sparse 100% S=256] epoch  1/25  test 43.23%  (best 43.23%)    1.7s
+    [sparse 100% S=256] epoch  2/25  test 45.57%  (best 45.57%)    3.5s
+    [sparse 100% S=256] epoch  3/25  test 49.37%  (best 49.37%)    5.4s
+    [sparse 100% S=256] epoch  4/25  test 50.93%  (best 50.93%)    7.3s
+    [sparse 100% S=256] epoch  5/25  test 52.10%  (best 52.10%)    9.0s
+    [sparse 100% S=256] epoch  6/25  test 52.75%  (best 52.75%)   10.7s
+    [sparse 100% S=256] epoch  7/25  test 54.14%  (best 54.14%)   12.4s
+    [sparse 100% S=256] epoch  8/25  test 53.89%  (best 54.14%)   14.2s
+    [sparse 100% S=256] epoch  9/25  test 55.49%  (best 55.49%)   15.9s
+    [sparse 100% S=256] epoch 10/25  test 55.95%  (best 55.95%)   17.8s
+    [sparse 100% S=256] epoch 11/25  test 55.84%  (best 55.95%)   19.5s
+    [sparse 100% S=256] epoch 12/25  test 57.24%  (best 57.24%)   21.3s
+    [sparse 100% S=256] epoch 13/25  test 57.20%  (best 57.24%)   23.1s
+    [sparse 100% S=256] epoch 14/25  test 57.20%  (best 57.24%)   24.9s
+    [sparse 100% S=256] epoch 15/25  test 58.34%  (best 58.34%)   26.8s
+    [sparse 100% S=256] epoch 16/25  test 58.70%  (best 58.70%)   28.5s
+    [sparse 100% S=256] epoch 17/25  test 59.13%  (best 59.13%)   30.5s
+    [sparse 100% S=256] epoch 18/25  test 59.54%  (best 59.54%)   32.2s
+    [sparse 100% S=256] epoch 19/25  test 60.23%  (best 60.23%)   33.9s
+    [sparse 100% S=256] epoch 20/25  test 60.42%  (best 60.42%)   35.6s
+    [sparse 100% S=256] epoch 21/25  test 60.82%  (best 60.82%)   37.5s
+    [sparse 100% S=256] epoch 22/25  test 61.35%  (best 61.35%)   39.1s
+    [sparse 100% S=256] epoch 23/25  test 61.00%  (best 61.35%)   40.8s
+    [sparse 100% S=256] epoch 24/25  test 61.12%  (best 61.35%)   42.6s
+    [sparse 100% S=256] epoch 25/25  test 61.00%  (best 61.35%)   44.3s
+   -> best test 61.35%
+
+>> SPARSE density=50%  solved S=306
+   S=306  density=50%  trainable params=1,321,012  (dense-equiv 749,088)
+    [sparse 50% S=306] epoch  1/25  test 42.40%  (best 42.40%)    2.8s
+    [sparse 50% S=306] epoch  2/25  test 45.55%  (best 45.55%)    4.8s
+    [sparse 50% S=306] epoch  3/25  test 48.64%  (best 48.64%)    7.0s
+    [sparse 50% S=306] epoch  4/25  test 50.17%  (best 50.17%)    9.1s
+    [sparse 50% S=306] epoch  5/25  test 51.55%  (best 51.55%)   11.1s
+    [sparse 50% S=306] epoch  6/25  test 51.91%  (best 51.91%)   13.3s
+    [sparse 50% S=306] epoch  7/25  test 53.21%  (best 53.21%)   15.4s
+    [sparse 50% S=306] epoch  8/25  test 53.42%  (best 53.42%)   17.5s
+    [sparse 50% S=306] epoch  9/25  test 54.57%  (best 54.57%)   20.8s
+    [sparse 50% S=306] epoch 10/25  test 54.41%  (best 54.57%)   23.0s
+    [sparse 50% S=306] epoch 11/25  test 55.41%  (best 55.41%)   25.0s
+    [sparse 50% S=306] epoch 12/25  test 56.14%  (best 56.14%)   27.3s
+    [sparse 50% S=306] epoch 13/25  test 55.92%  (best 56.14%)   29.7s
+    [sparse 50% S=306] epoch 14/25  test 56.60%  (best 56.60%)   31.8s
+    [sparse 50% S=306] epoch 15/25  test 57.82%  (best 57.82%)   33.7s
+    [sparse 50% S=306] epoch 16/25  test 57.58%  (best 57.82%)   35.4s
+    [sparse 50% S=306] epoch 17/25  test 58.98%  (best 58.98%)   37.2s
+    [sparse 50% S=306] epoch 18/25  test 59.08%  (best 59.08%)   39.0s
+    [sparse 50% S=306] epoch 19/25  test 60.20%  (best 60.20%)   41.6s
+    [sparse 50% S=306] epoch 20/25  test 60.25%  (best 60.25%)   44.1s
+    [sparse 50% S=306] epoch 21/25  test 59.91%  (best 60.25%)   46.0s
+    [sparse 50% S=306] epoch 22/25  test 60.48%  (best 60.48%)   47.7s
+    [sparse 50% S=306] epoch 23/25  test 60.63%  (best 60.63%)   49.6s
+    [sparse 50% S=306] epoch 24/25  test 60.70%  (best 60.70%)   51.5s
+    [sparse 50% S=306] epoch 25/25  test 60.67%  (best 60.70%)   53.2s
+   -> best test 60.70%
+
+>> SPARSE density=25%  solved S=348
+   S=348  density=25%  trainable params=1,318,582  (dense-equiv 968,832)
+    [sparse 25% S=348] epoch  1/25  test 41.71%  (best 41.71%)    3.0s
+    [sparse 25% S=348] epoch  2/25  test 45.32%  (best 45.32%)    4.9s
+    [sparse 25% S=348] epoch  3/25  test 47.45%  (best 47.45%)    6.8s
+    [sparse 25% S=348] epoch  4/25  test 49.25%  (best 49.25%)    8.8s
+    [sparse 25% S=348] epoch  5/25  test 49.65%  (best 49.65%)   10.7s
+    [sparse 25% S=348] epoch  6/25  test 51.52%  (best 51.52%)   12.6s
+    [sparse 25% S=348] epoch  7/25  test 51.80%  (best 51.80%)   14.6s
+    [sparse 25% S=348] epoch  8/25  test 52.70%  (best 52.70%)   16.6s
+    [sparse 25% S=348] epoch  9/25  test 53.39%  (best 53.39%)   18.6s
+    [sparse 25% S=348] epoch 10/25  test 53.52%  (best 53.52%)   21.3s
+    [sparse 25% S=348] epoch 11/25  test 54.03%  (best 54.03%)   23.6s
+    [sparse 25% S=348] epoch 12/25  test 55.21%  (best 55.21%)   25.8s
+    [sparse 25% S=348] epoch 13/25  test 55.40%  (best 55.40%)   27.9s
+    [sparse 25% S=348] epoch 14/25  test 57.02%  (best 57.02%)   29.8s
+    [sparse 25% S=348] epoch 15/25  test 56.98%  (best 57.02%)   31.7s
+    [sparse 25% S=348] epoch 16/25  test 56.96%  (best 57.02%)   33.7s
+    [sparse 25% S=348] epoch 17/25  test 57.50%  (best 57.50%)   35.6s
+    [sparse 25% S=348] epoch 18/25  test 58.32%  (best 58.32%)   37.8s
+    [sparse 25% S=348] epoch 19/25  test 58.48%  (best 58.48%)   39.8s
+    [sparse 25% S=348] epoch 20/25  test 58.99%  (best 58.99%)   41.8s
+    [sparse 25% S=348] epoch 21/25  test 59.28%  (best 59.28%)   43.8s
+    [sparse 25% S=348] epoch 22/25  test 59.41%  (best 59.41%)   45.8s
+    [sparse 25% S=348] epoch 23/25  test 59.63%  (best 59.63%)   49.0s
+    [sparse 25% S=348] epoch 24/25  test 59.62%  (best 59.63%)   51.1s
+    [sparse 25% S=348] epoch 25/25  test 59.75%  (best 59.75%)   53.1s
+   -> best test 59.75%
+
+>> SPARSE density=10%  solved S=387
+   S=387  density=10%  trainable params=1,316,817  (dense-equiv 1,198,152)
+    [sparse 10% S=387] epoch  1/25  test 42.87%  (best 42.87%)    2.2s
+    [sparse 10% S=387] epoch  2/25  test 45.06%  (best 45.06%)    4.2s
+    [sparse 10% S=387] epoch  3/25  test 46.62%  (best 46.62%)    6.5s
+    [sparse 10% S=387] epoch  4/25  test 48.91%  (best 48.91%)    8.7s
+    [sparse 10% S=387] epoch  5/25  test 49.72%  (best 49.72%)   10.9s
+    [sparse 10% S=387] epoch  6/25  test 49.98%  (best 49.98%)   13.0s
+    [sparse 10% S=387] epoch  7/25  test 49.77%  (best 49.98%)   15.0s
+    [sparse 10% S=387] epoch  8/25  test 51.11%  (best 51.11%)   17.2s
+    [sparse 10% S=387] epoch  9/25  test 51.14%  (best 51.14%)   19.4s
+    [sparse 10% S=387] epoch 10/25  test 53.12%  (best 53.12%)   21.4s
+    [sparse 10% S=387] epoch 11/25  test 52.86%  (best 53.12%)   23.6s
+    [sparse 10% S=387] epoch 12/25  test 53.96%  (best 53.96%)   25.7s
+    [sparse 10% S=387] epoch 13/25  test 54.18%  (best 54.18%)   28.0s
+    [sparse 10% S=387] epoch 14/25  test 54.52%  (best 54.52%)   30.2s
+    [sparse 10% S=387] epoch 15/25  test 54.78%  (best 54.78%)   32.4s
+    [sparse 10% S=387] epoch 16/25  test 55.43%  (best 55.43%)   34.6s
+    [sparse 10% S=387] epoch 17/25  test 56.22%  (best 56.22%)   36.6s
+    [sparse 10% S=387] epoch 18/25  test 56.43%  (best 56.43%)   38.7s
+    [sparse 10% S=387] epoch 19/25  test 57.32%  (best 57.32%)   40.9s
+    [sparse 10% S=387] epoch 20/25  test 57.74%  (best 57.74%)   43.1s
+    [sparse 10% S=387] epoch 21/25  test 57.95%  (best 57.95%)   45.3s
+    [sparse 10% S=387] epoch 22/25  test 58.10%  (best 58.10%)   47.4s
+    [sparse 10% S=387] epoch 23/25  test 58.29%  (best 58.29%)   49.5s
+    [sparse 10% S=387] epoch 24/25  test 58.54%  (best 58.54%)   51.6s
+    [sparse 10% S=387] epoch 25/25  test 58.54%  (best 58.54%)   53.8s
+   -> best test 58.54%
+
+>> SPARSE density=5%  solved S=405
+   S=405  density=5%  trainable params=1,318,283  (dense-equiv 1,312,200)
+    [sparse 5% S=405] epoch  1/25  test 41.81%  (best 41.81%)    2.7s
+    [sparse 5% S=405] epoch  2/25  test 44.47%  (best 44.47%)    4.7s
+    [sparse 5% S=405] epoch  3/25  test 45.49%  (best 45.49%)    7.0s
+    [sparse 5% S=405] epoch  4/25  test 48.87%  (best 48.87%)    9.2s
+    [sparse 5% S=405] epoch  5/25  test 48.98%  (best 48.98%)   11.4s
+    [sparse 5% S=405] epoch  6/25  test 50.80%  (best 50.80%)   13.8s
+    [sparse 5% S=405] epoch  7/25  test 50.10%  (best 50.80%)   16.2s
+    [sparse 5% S=405] epoch  8/25  test 50.87%  (best 50.87%)   18.5s
+    [sparse 5% S=405] epoch  9/25  test 52.85%  (best 52.85%)   20.6s
+    [sparse 5% S=405] epoch 10/25  test 52.88%  (best 52.88%)   22.9s
+    [sparse 5% S=405] epoch 11/25  test 53.09%  (best 53.09%)   25.2s
+    [sparse 5% S=405] epoch 12/25  test 53.85%  (best 53.85%)   27.5s
+    [sparse 5% S=405] epoch 13/25  test 54.30%  (best 54.30%)   29.7s
+    [sparse 5% S=405] epoch 14/25  test 54.85%  (best 54.85%)   31.9s
+    [sparse 5% S=405] epoch 15/25  test 55.34%  (best 55.34%)   34.2s
+    [sparse 5% S=405] epoch 16/25  test 55.58%  (best 55.58%)   36.6s
+    [sparse 5% S=405] epoch 17/25  test 55.92%  (best 55.92%)   38.8s
+    [sparse 5% S=405] epoch 18/25  test 56.77%  (best 56.77%)   40.9s
+    [sparse 5% S=405] epoch 19/25  test 56.91%  (best 56.91%)   43.1s
+    [sparse 5% S=405] epoch 20/25  test 57.36%  (best 57.36%)   45.4s
+    [sparse 5% S=405] epoch 21/25  test 57.58%  (best 57.58%)   47.8s
+    [sparse 5% S=405] epoch 22/25  test 57.69%  (best 57.69%)   50.3s
+    [sparse 5% S=405] epoch 23/25  test 57.80%  (best 57.80%)   52.5s
+    [sparse 5% S=405] epoch 24/25  test 57.87%  (best 57.87%)   54.8s
+    [sparse 5% S=405] epoch 25/25  test 57.82%  (best 57.87%)   56.9s
+   -> best test 57.87%
+
+>> SPARSE density=2%  solved S=417
+   S=417  density=2%  trainable params=1,317,615  (dense-equiv 1,391,112)
+    [sparse 2% S=417] epoch  1/25  test 41.32%  (best 41.32%)    3.6s
+    [sparse 2% S=417] epoch  2/25  test 43.97%  (best 43.97%)    6.3s
+    [sparse 2% S=417] epoch  3/25  test 46.92%  (best 46.92%)    9.1s
+    [sparse 2% S=417] epoch  4/25  test 46.85%  (best 46.92%)   11.8s
+    [sparse 2% S=417] epoch  5/25  test 48.95%  (best 48.95%)   14.5s
+    [sparse 2% S=417] epoch  6/25  test 49.16%  (best 49.16%)   17.4s
+    [sparse 2% S=417] epoch  7/25  test 49.65%  (best 49.65%)   20.0s
+    [sparse 2% S=417] epoch  8/25  test 50.26%  (best 50.26%)   22.7s
+    [sparse 2% S=417] epoch  9/25  test 51.25%  (best 51.25%)   25.3s
+    [sparse 2% S=417] epoch 10/25  test 52.20%  (best 52.20%)   28.0s
+    [sparse 2% S=417] epoch 11/25  test 52.54%  (best 52.54%)   31.7s
+    [sparse 2% S=417] epoch 12/25  test 53.14%  (best 53.14%)   34.5s
+    [sparse 2% S=417] epoch 13/25  test 53.74%  (best 53.74%)   37.4s
+    [sparse 2% S=417] epoch 14/25  test 53.62%  (best 53.74%)   39.8s
+    [sparse 2% S=417] epoch 15/25  test 53.52%  (best 53.74%)   42.5s
+    [sparse 2% S=417] epoch 16/25  test 55.30%  (best 55.30%)   45.0s
+    [sparse 2% S=417] epoch 17/25  test 55.67%  (best 55.67%)   47.7s
+    [sparse 2% S=417] epoch 18/25  test 55.57%  (best 55.67%)   50.4s
+    [sparse 2% S=417] epoch 19/25  test 56.40%  (best 56.40%)   53.2s
+    [sparse 2% S=417] epoch 20/25  test 56.56%  (best 56.56%)   55.7s
+    [sparse 2% S=417] epoch 21/25  test 56.59%  (best 56.59%)   58.3s
+    [sparse 2% S=417] epoch 22/25  test 57.02%  (best 57.02%)   61.4s
+    [sparse 2% S=417] epoch 23/25  test 57.02%  (best 57.02%)   65.7s
+    [sparse 2% S=417] epoch 24/25  test 57.27%  (best 57.27%)   68.3s
+    [sparse 2% S=417] epoch 25/25  test 57.29%  (best 57.29%)   70.9s
+   -> best test 57.29%
+
+
+================================================================
+CIFAR-10  |  ~equal params (1,316,106)  |  4 blocks
+================================================================
+     model      S  density      params  best test
+     dense    256    100%   1,316,106     61.00%
+    sparse    256    100%   1,316,106     61.35%
+    sparse    306     50%   1,321,012     60.70%
+    sparse    348     25%   1,318,582     59.75%
+    sparse    387     10%   1,316,817     58.54%
+    sparse    405      5%   1,318,283     57.87%
+    sparse    417      2%   1,317,615     57.29%
