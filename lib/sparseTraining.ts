@@ -814,78 +814,75 @@ function makeBlockLayer(dim: number, init: Matrix): BlockLayer {
 // one that is actively learning (high gradient). A swap only happens when the
 // incoming block's gradient energy clearly beats the (near-zero) pruned block's, by
 // a margin, so a move is always net-positive.
-// Weight energy is the spike-safe gate (a block with <6% of the mean weight
-// energy carries little output, so evicting it barely perturbs W). Momentum/grad
-// energy < 25% of mean additionally requires the block to be idle. (Energies are
-// squared norms, so these are the squares of a 25%/50% norm threshold.)
-const BLOCK_DEAD_W_FRAC = 0.0625; // weight energy < 6.25% of mean -> spike-safe
-const BLOCK_DEAD_MG_FRAC = 0.25; // momentum & grad energy < 25% of mean -> idle
-const BLOCK_GROW_MARGIN = 4; // grow candidate grad energy must exceed pruned block's by ≥4×
+// Block migration is ANNEALED, not thresholded (RigL-style): each grow-prune
+// event moves `nMove` blocks — pruning the lowest-WEIGHT-energy blocks (spike-safe:
+// they contribute least to the output, so removing them barely perturbs W, and a
+// high-weight "live" block is never evicted) and growing the highest-gradient-
+// energy positions. nMove starts at a fraction of the block count (explore) and
+// cosine-decays to 0 (converge/freeze). A hard deadness threshold froze the layer;
+// annealing gives exploration early and a spike-free freeze late.
+export const BLOCK_MOVE_BASE_FRAC = 0.5; // fraction of blocks eligible to move early
+const BLOCK_MOVE_STOP_FRAC = 0.85; // freeze block topology after this fraction of training
+
+function blockMoveCount(progress: number, nBlocks: number): number {
+  if (progress >= BLOCK_MOVE_STOP_FRAC) return 0;
+  const p = progress / BLOCK_MOVE_STOP_FRAC; // 0 -> 1 over the moving phase
+  const frac = BLOCK_MOVE_BASE_FRAC * 0.5 * (1 + Math.cos(Math.PI * p));
+  return Math.round(frac * nBlocks);
+}
 
 function applyBlockGrowPrune(
   layer: BlockLayer,
   grad: Matrix,
-  G: number
+  G: number,
+  nMove: number
 ): { grown: [number, number] | null; pruned: [number, number] | null } {
-  let sumW = 0,
-    sumM = 0,
-    sumG = 0,
-    nb = 0;
-  for (const key of layer.blocks) {
+  if (nMove <= 0) return { grown: null, pruned: null };
+  const nActive = layer.blocks.size;
+  const nFree = G * G - nActive;
+  const k = Math.min(nMove, nActive, nFree);
+  if (k <= 0) return { grown: null, pruned: null };
+
+  // prune: the k active blocks with the LOWEST weight energy (spike-safe)
+  const active = [...layer.blocks].map((key) => {
     const [bi, bj] = key.split(":").map(Number);
-    sumW += blockEnergy(layer.W, bi, bj);
-    sumM += blockEnergy(layer.m, bi, bj);
-    sumG += blockEnergy(grad, bi, bj);
-    nb += 1;
-  }
-  const meanW = sumW / nb || 1e-12;
-  const meanM = sumM / nb || 1e-12;
-  const meanG = sumG / nb || 1e-12;
-  // prune: deadest block whose weight AND momentum AND gradient are all near-zero
-  let prune: [number, number] | null = null;
-  let pruneScore = Infinity;
-  let pruneGradE = 0;
-  for (const key of layer.blocks) {
-    const [bi, bj] = key.split(":").map(Number);
-    const w = blockEnergy(layer.W, bi, bj) / meanW;
-    const mm = blockEnergy(layer.m, bi, bj) / meanM;
-    const gg = blockEnergy(grad, bi, bj) / meanG;
-    if (w < BLOCK_DEAD_W_FRAC && mm < BLOCK_DEAD_MG_FRAC && gg < BLOCK_DEAD_MG_FRAC && w + mm + gg < pruneScore) {
-      pruneScore = w + mm + gg;
-      prune = [bi, bj];
-      pruneGradE = blockEnergy(grad, bi, bj);
-    }
-  }
-  // grow: inactive block with the largest gradient energy
-  let grow: [number, number] | null = null;
-  let growE = -1;
+    return { bi, bj, e: blockEnergy(layer.W, bi, bj) };
+  });
+  active.sort((a, b) => a.e - b.e);
+  const prune = active.slice(0, k);
+
+  // grow: the k inactive positions with the HIGHEST gradient energy
+  const free: { bi: number; bj: number; e: number }[] = [];
   for (let bi = 0; bi < G; bi++)
     for (let bj = 0; bj < G; bj++) {
       if (layer.blocks.has(`${bi}:${bj}`)) continue;
-      const e = blockEnergy(grad, bi, bj);
-      if (e > growE) {
-        growE = e;
-        grow = [bi, bj];
-      }
+      free.push({ bi, bj, e: blockEnergy(grad, bi, bj) });
     }
-  if (grow && prune && growE > BLOCK_GROW_MARGIN * Math.max(pruneGradE, 1e-12)) {
-    layer.blocks.delete(`${prune[0]}:${prune[1]}`);
-    layer.blocks.add(`${grow[0]}:${grow[1]}`);
-    for (const [r, c] of blockCells(prune[0], prune[1])) {
+  free.sort((a, b) => b.e - a.e);
+  const grow = free.slice(0, k);
+
+  for (let i = 0; i < k; i++) {
+    const p = prune[i];
+    const g = grow[i];
+    layer.blocks.delete(`${p.bi}:${p.bj}`);
+    layer.blocks.add(`${g.bi}:${g.bj}`);
+    for (const [r, c] of blockCells(p.bi, p.bj)) {
       layer.W[r][c] = 0;
       layer.m[r][c] = 0;
       layer.v[r][c] = 0;
     }
-    for (const [r, c] of blockCells(grow[0], grow[1])) {
+    for (const [r, c] of blockCells(g.bi, g.bj)) {
       layer.W[r][c] = 0; // grow from zero
       layer.m[r][c] = 0;
       layer.v[r][c] = 0;
     }
-    layer.cells = blockCellsOf(layer.blocks);
-    // return the block's top-left cell as the marker position
-    return { grown: [grow[0] * BLOCK_B, grow[1] * BLOCK_B], pruned: [prune[0] * BLOCK_B, prune[1] * BLOCK_B] };
   }
-  return { grown: null, pruned: null };
+  layer.cells = blockCellsOf(layer.blocks);
+  // return the first swap's top-left cells as the animation marker
+  return {
+    grown: [grow[0].bi * BLOCK_B, grow[0].bj * BLOCK_B],
+    pruned: [prune[0].bi * BLOCK_B, prune[0].bj * BLOCK_B],
+  };
 }
 
 function buildBlockFrames(
@@ -945,9 +942,10 @@ function buildBlockFrames(
       let g1: { grown: [number, number] | null; pruned: [number, number] | null } = { grown: null, pruned: null };
       let g2 = g1;
       if (epoch >= 1 && batchStart === 0) {
+        const nMove = blockMoveCount(epoch / EPOCHS, BLOCK_N);
         const probe = grads2(batchIndices, X, Y, L1.W, L2.W, cfg);
-        g1 = applyBlockGrowPrune(L1, probe.gW1, G);
-        g2 = applyBlockGrowPrune(L2, probe.gW2, G);
+        g1 = applyBlockGrowPrune(L1, probe.gW1, G, nMove);
+        g2 = applyBlockGrowPrune(L2, probe.gW2, G, nMove);
       }
       const { gW1, gW2, dataLoss } = grads2(batchIndices, X, Y, L1.W, L2.W, cfg);
       const dataFullLoss = fullLoss2(L1.W, L2.W, X, Y, cfg);
