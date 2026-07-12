@@ -41,6 +41,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from model import TinyGPT, GPTConfig, BlockSparseSwiGLU  # noqa: E402
+from block_sparse import annealed_n_swap  # noqa: E402
 
 # ---------------------------------------------------------------- config ----
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -53,6 +54,8 @@ LOG_EVERY = int(os.environ.get("LOG_EVERY", "50"))
 N_STORIES = int(os.environ.get("N_STORIES", "20000"))
 RIGL_EVERY = int(os.environ.get("RIGL_EVERY", "50"))
 GROW_STOP_FRAC = 0.8            # freeze block topology after this fraction of steps
+CKPT_EVERY = int(os.environ.get("CKPT_EVERY", "200"))   # save intermediate checkpoints
+CKPT_DIR = os.path.join(HERE, "checkpoints")
 
 # architecture knobs
 SHALLOW = int(os.environ.get("SHALLOW", "6"))     # dense / ple depth
@@ -207,6 +210,15 @@ def eval_val(model, val, vocab_size):
     return float(sum(losses) / max(len(losses), 1))
 
 
+def save_ckpt(model, cfg, label, step):
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"{label}_step{step}.pt")
+    torch.save({"model_state_dict": model.state_dict(), "config": cfg.to_dict(),
+                "tokenizer_path": TOKENIZER_PATH, "global_step": step,
+                "label": label, "experiment": "deep_sparse"}, path)
+    return path
+
+
 def train_one(label, cfg, train, val, vocab_size):
     torch.manual_seed(SEED)
     model = TinyGPT(cfg).to(DEVICE)
@@ -214,11 +226,11 @@ def train_one(label, cfg, train, val, vocab_size):
     opt = build_optimizer(model)
     sched = make_scheduler(opt, STEPS)
 
-    # block grow-prune swap size (from the first block FFN's active-block count)
-    n_swap, is_block = 0, cfg.ffn_type == "block"
+    # block grow-prune: cosine-annealed swap count (from the block FFN's n_active)
+    n_active, is_block = 0, cfg.ffn_type == "block"
     if is_block:
         bffn = next(m for m in model.modules() if isinstance(m, BlockSparseSwiGLU))
-        n_swap = max(1, round(0.03 * bffn.gate.n_active))
+        n_active = bffn.gate.n_active
 
     it = batch_iter(train, BATCH, seed=42)
     curve, moved_total = [], 0
@@ -239,9 +251,12 @@ def train_one(label, cfg, train, val, vocab_size):
         opt.step()
         sched.step()
 
-        # block-sparse grow-and-prune (whole dead blocks migrate), then freeze
-        if is_block and step % RIGL_EVERY == 0 and step < GROW_STOP_FRAC * STEPS:
-            moved_total += model.sparse_update(opt, n_swap=n_swap)
+        # block-sparse grow-and-prune: cosine-annealed migration (explore early,
+        # freeze late) — lowest-weight blocks move to highest-gradient positions
+        if is_block and step % RIGL_EVERY == 0:
+            ns = annealed_n_swap(step, STEPS, n_active, base_frac=0.3, stop_frac=GROW_STOP_FRAC)
+            if ns > 0:
+                moved_total += model.sparse_update(opt, n_swap=ns)
 
         total_tokens += x.numel()
         if DEVICE == "mps":
@@ -256,6 +271,9 @@ def train_one(label, cfg, train, val, vocab_size):
                           "val_loss": lv, "tok_s": tps, "moved": moved_total})
             print(f"  [{label:11s}] step {step:4d}/{STEPS}  train {loss.item():.4f}  "
                   f"val {lv:.4f}  {tps:,.0f} tok/s  moved={moved_total}", flush=True)
+
+        if step % CKPT_EVERY == 0 or step == STEPS:
+            save_ckpt(model, cfg, label, step)
 
     elapsed = time.time() - t0
     return {"label": label, "ffn_type": cfg.ffn_type, "n_layers": cfg.n_layers,

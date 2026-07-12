@@ -151,7 +151,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos", angles.cos())
         self.register_buffer("sin", angles.sin())
 
-    def apply(self, q, k, pos_ids):
+    def forward(self, q, k, pos_ids):
         cos = self.cos[pos_ids].unsqueeze(1)
         sin = self.sin[pos_ids].unsqueeze(1)
 
@@ -210,7 +210,7 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        q, k = self.rope.apply(q, k, pos_ids)
+        q, k = self.rope(q, k, pos_ids)
 
         if kv_cache is not None:
             k_prev, v_prev = kv_cache
@@ -557,6 +557,23 @@ class TinyGPT(nn.Module):
         # AttnRes: learned query vector per layer + final output
         if cfg.attn_res:
             self.ar_proj = nn.Parameter(torch.randn(n_layers + 1, C) * 0.02)
+
+        # GPT-2-style init: N(0, 0.02) on Linear/Embedding weights, zero biases.
+        # Without this the tied N(0,1) embedding/head makes the initial logits
+        # enormous (loss ~150) and wastes ~100 steps recovering. Custom sparse
+        # params (SparseLinear.values, BlockSparseLinear.blocks) keep their own
+        # fan-in init — _init_weights only touches nn.Linear/nn.Embedding, and it
+        # runs in-place so the tied lm_head/tok_emb weight stays shared.
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, kv_cache=None):
         B, T = idx.shape
