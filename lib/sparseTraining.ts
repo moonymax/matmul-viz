@@ -806,30 +806,51 @@ function makeBlockLayer(dim: number, init: Matrix): BlockLayer {
   return { W: cloneMatrix(init), m: zeroMatrix(dim), v: zeroMatrix(dim), blocks, cells: blockCellsOf(blocks) };
 }
 
+// A block is only "dead" (safe to evict) if its WEIGHT energy is a tiny fraction
+// of the MEAN active-block weight energy AND its momentum and gradient energy are
+// likewise near-zero in absolute (mean-relative) terms. Measuring deadness against
+// the mean — not the max — and requiring all three to be near-zero prevents ripping
+// out a block that still carries real weights (which would cause a loss spike) or
+// one that is actively learning (high gradient). A swap only happens when the
+// incoming block's gradient energy clearly beats the (near-zero) pruned block's, by
+// a margin, so a move is always net-positive.
+// Weight energy is the spike-safe gate (a block with <6% of the mean weight
+// energy carries little output, so evicting it barely perturbs W). Momentum/grad
+// energy < 25% of mean additionally requires the block to be idle. (Energies are
+// squared norms, so these are the squares of a 25%/50% norm threshold.)
+const BLOCK_DEAD_W_FRAC = 0.0625; // weight energy < 6.25% of mean -> spike-safe
+const BLOCK_DEAD_MG_FRAC = 0.25; // momentum & grad energy < 25% of mean -> idle
+const BLOCK_GROW_MARGIN = 4; // grow candidate grad energy must exceed pruned block's by ≥4×
+
 function applyBlockGrowPrune(
   layer: BlockLayer,
   grad: Matrix,
   G: number
 ): { grown: [number, number] | null; pruned: [number, number] | null } {
-  let maxW = 1e-12,
-    maxM = 1e-12,
-    maxG = 1e-12;
+  let sumW = 0,
+    sumM = 0,
+    sumG = 0,
+    nb = 0;
   for (const key of layer.blocks) {
     const [bi, bj] = key.split(":").map(Number);
-    maxW = Math.max(maxW, blockEnergy(layer.W, bi, bj));
-    maxM = Math.max(maxM, blockEnergy(layer.m, bi, bj));
-    maxG = Math.max(maxG, blockEnergy(grad, bi, bj));
+    sumW += blockEnergy(layer.W, bi, bj);
+    sumM += blockEnergy(layer.m, bi, bj);
+    sumG += blockEnergy(grad, bi, bj);
+    nb += 1;
   }
-  // prune: deadest safe block
+  const meanW = sumW / nb || 1e-12;
+  const meanM = sumM / nb || 1e-12;
+  const meanG = sumG / nb || 1e-12;
+  // prune: deadest block whose weight AND momentum AND gradient are all near-zero
   let prune: [number, number] | null = null;
   let pruneScore = Infinity;
   let pruneGradE = 0;
   for (const key of layer.blocks) {
     const [bi, bj] = key.split(":").map(Number);
-    const w = blockEnergy(layer.W, bi, bj) / maxW;
-    const mm = blockEnergy(layer.m, bi, bj) / maxM;
-    const gg = blockEnergy(grad, bi, bj) / maxG;
-    if (w < PRUNE_W_FRAC && mm < PRUNE_M_FRAC && gg < PRUNE_G_FRAC && w + mm + gg < pruneScore) {
+    const w = blockEnergy(layer.W, bi, bj) / meanW;
+    const mm = blockEnergy(layer.m, bi, bj) / meanM;
+    const gg = blockEnergy(grad, bi, bj) / meanG;
+    if (w < BLOCK_DEAD_W_FRAC && mm < BLOCK_DEAD_MG_FRAC && gg < BLOCK_DEAD_MG_FRAC && w + mm + gg < pruneScore) {
       pruneScore = w + mm + gg;
       prune = [bi, bj];
       pruneGradE = blockEnergy(grad, bi, bj);
@@ -847,7 +868,7 @@ function applyBlockGrowPrune(
         grow = [bi, bj];
       }
     }
-  if (grow && prune && growE > pruneGradE) {
+  if (grow && prune && growE > BLOCK_GROW_MARGIN * Math.max(pruneGradE, 1e-12)) {
     layer.blocks.delete(`${prune[0]}:${prune[1]}`);
     layer.blocks.add(`${grow[0]}:${grow[1]}`);
     for (const [r, c] of blockCells(prune[0], prune[1])) {

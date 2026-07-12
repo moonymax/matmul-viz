@@ -48,3 +48,6 @@ __pycache__/
 # datasets / caches (do not commit)
 python/data/
 *.pt
+
+# experiment result artifacts
+python/lm/exp_*_results.json

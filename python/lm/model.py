@@ -31,6 +31,17 @@ try:  # works both as a package (lm.model) and as a plain script on sys.path
 except ImportError:  # pragma: no cover
     from sparse_linear import SparseLinear
 
+# BlockSparseLinear lives in python/ (one level above lm/); add it to sys.path.
+try:
+    import os as _os
+    import sys as _sys
+    _PY = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _PY not in _sys.path:
+        _sys.path.insert(0, _PY)
+    from block_sparse import BlockSparseLinear
+except ImportError:  # pragma: no cover
+    BlockSparseLinear = None
+
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -50,11 +61,21 @@ class GPTConfig:
     n_layers: int = 11
     head_dim: int = 32
     uniform_heads: int = UNIFORM_HEADS   # HEADS_PER_LAYER = [uniform_heads] * n_layers
+    n_kv_heads: int = UNIFORM_HEADS      # GQA: K/V head count (< uniform_heads groups queries)
     block_size: int = 512
     attn_res: bool = True
 
+    # --- multi-token prediction (Meta/Gloeckle parallel heads) ---
+    n_mtp: int = 0                  # extra future-token heads (0 disables MTP)
+    mtp_weight: float = 0.3         # weight of each auxiliary MTP head loss
+
     # --- FFN selection ---
-    ffn_type: str = "ple"           # {"ple", "sparse", "moe", "dense", "sparse_wide"}
+    ffn_type: str = "ple"           # {"ple","sparse","moe","dense","sparse_wide","block"}
+
+    # --- "block" variant (moveable dense b x b blocks; grow-and-prune) ---
+    block_hidden: int = 768         # SwiGLU hidden dim (wide)
+    block_b: int = 16               # block edge
+    block_density: float = 0.25     # fraction of b x b tiles active (solved for param parity)
 
     # --- "sparse" variant ---
     sparse_hidden: int = 6144
@@ -86,13 +107,26 @@ class GPTConfig:
     def attn_dim(self):
         return self.uniform_heads * self.head_dim
 
+    @property
+    def kv_dim(self):
+        return self.n_kv_heads * self.head_dim
+
     def validate(self):
-        assert self.ffn_type in ("ple", "sparse", "moe", "dense", "sparse_wide"), \
+        assert self.ffn_type in ("ple", "sparse", "moe", "dense", "sparse_wide", "block"), \
             f"bad ffn_type {self.ffn_type}"
         assert self.attn_dim != self.embed_dim, (
             f"design constraint violated: n_heads*head_dim ({self.attn_dim}) "
             f"must differ from embed_dim ({self.embed_dim})"
         )
+        assert self.uniform_heads % self.n_kv_heads == 0, (
+            f"GQA requires uniform_heads ({self.uniform_heads}) divisible by "
+            f"n_kv_heads ({self.n_kv_heads})"
+        )
+        if self.ffn_type == "block":
+            assert self.embed_dim % self.block_b == 0 and self.block_hidden % self.block_b == 0, (
+                f"block_b ({self.block_b}) must divide embed_dim ({self.embed_dim}) "
+                f"and block_hidden ({self.block_hidden})"
+            )
         return self
 
     def to_dict(self):
@@ -132,19 +166,33 @@ class RotaryEmbedding(nn.Module):
 # Attention (supports n_heads * head_dim != embed_dim) + KV-cache
 # --------------------------------------------------------------------------- #
 class CausalSelfAttention(nn.Module):
-    def __init__(self, embed_dim, n_heads, head_dim, block_size, sparse=False, density=0.0):
+    """GQA-capable causal self-attention.
+
+    Query has `n_heads` heads; keys/values have `n_kv_heads` heads (n_kv_heads
+    divides n_heads). Each KV head is shared by `n_heads // n_kv_heads` query
+    heads (repeat_interleave before the score matmul). n_kv_heads == n_heads
+    recovers plain multi-head attention.
+    """
+
+    def __init__(self, embed_dim, n_heads, head_dim, block_size,
+                 n_kv_heads=None, sparse=False, density=0.0):
         super().__init__()
         self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads or n_heads
+        assert n_heads % self.n_kv_heads == 0
+        self.n_rep = n_heads // self.n_kv_heads
         self.head_dim = head_dim
         self.attn_dim = attn_dim = n_heads * head_dim
+        self.kv_dim = kv_dim = self.n_kv_heads * head_dim
+        self.qkv_out = attn_dim + 2 * kv_dim          # q (+ k, v with fewer heads)
         self.sparse = sparse
         if sparse:
-            k_qkv = max(1, round(density * embed_dim * 3 * attn_dim))
+            k_qkv = max(1, round(density * embed_dim * self.qkv_out))
             k_proj = max(1, round(density * attn_dim * embed_dim))
-            self.qkv = SparseLinear(embed_dim, 3 * attn_dim, k_qkv)
+            self.qkv = SparseLinear(embed_dim, self.qkv_out, k_qkv)
             self.proj = SparseLinear(attn_dim, embed_dim, k_proj)
         else:
-            self.qkv = nn.Linear(embed_dim, 3 * attn_dim)
+            self.qkv = nn.Linear(embed_dim, self.qkv_out)
             self.proj = nn.Linear(attn_dim, embed_dim)
         self.rope = RotaryEmbedding(head_dim, block_size)
         self.register_buffer(
@@ -156,8 +204,11 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape
         # SparseLinear expects 2-D (N, in); nn.Linear handles 3-D natively.
         qkv = self.qkv(x.reshape(B * T, C)) if self.sparse else self.qkv(x)
-        qkv = qkv.reshape(B, T, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        qkv = qkv.reshape(B, T, self.qkv_out)
+        q, k, v = qkv.split([self.attn_dim, self.kv_dim, self.kv_dim], dim=-1)
+        q = q.reshape(B, T, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, T, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
 
         q, k = self.rope.apply(q, k, pos_ids)
 
@@ -166,8 +217,13 @@ class CausalSelfAttention(nn.Module):
             k = torch.cat([k_prev, k], dim=2)
             v = torch.cat([v_prev, v], dim=2)
 
-        new_cache = (k, v)
+        new_cache = (k, v)                            # cache the compact KV (pre-repeat)
         S = k.shape[2]
+
+        # expand KV heads to match the query-head count (GQA)
+        if self.n_rep > 1:
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
 
         att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         if T > 1:
@@ -375,6 +431,59 @@ class SparseWideSwiGLU(nn.Module):
         return out.reshape(B, T, C)
 
 
+# --------------------------------------------------------------------------- #
+# FFN variant 6: BLOCK-SPARSE bias-free SwiGLU. gate/up/down are BlockSparseLinear
+# (moveable dense b x b tiles, grow-and-prune). Param-equal to DenseSwiGLU by
+# construction (n_active chosen from block_density). The blocks run as batched
+# dense matmuls (GPU matmul units). During training the layer captures its input
+# and output-gradient (forward/backward hooks) so a periodic grow-and-prune can
+# migrate whole blocks toward the highest-gradient-energy regions.
+# --------------------------------------------------------------------------- #
+class BlockSparseSwiGLU(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        if BlockSparseLinear is None:
+            raise ImportError("BlockSparseSwiGLU needs python/block_sparse.py")
+        C = cfg.embed_dim
+        H = cfg.block_hidden
+        b = cfg.block_b
+        d = cfg.block_density
+        n_in = max(1, round(d * (C // b) * (H // b)))    # blocks for C->H (gate, up)
+        n_out = max(1, round(d * (H // b) * (C // b)))   # blocks for H->C (down)
+        self.gate = BlockSparseLinear(C, H, b, n_in)
+        self.up = BlockSparseLinear(C, H, b, n_in)
+        self.down = BlockSparseLinear(H, C, b, n_out)
+        self._blocks = [self.gate, self.up, self.down]
+        self._cap = {}   # id(layer) -> [input, grad_out] captured during train step
+        for m in self._blocks:
+            m.register_forward_hook(self._fhook)
+            m.register_full_backward_hook(self._bhook)
+
+    def _fhook(self, mod, inp, out):
+        if mod.training:
+            self._cap.setdefault(id(mod), [None, None])[0] = inp[0].detach()
+
+    def _bhook(self, mod, gin, gout):
+        if mod.training:
+            self._cap.setdefault(id(mod), [None, None])[1] = gout[0].detach()
+
+    def forward(self, x, token_ids=None):
+        B, T, C = x.shape
+        xf = x.reshape(-1, C)
+        h = F.silu(self.gate(xf)) * self.up(xf)
+        out = self.down(h)
+        return out.reshape(B, T, C)
+
+    @torch.no_grad()
+    def grow_prune(self, optimizer, n_swap):
+        moved = 0
+        for m in self._blocks:
+            cx, cg = self._cap.get(id(m), [None, None])
+            if cx is not None and cg is not None:
+                moved += m.grow_prune(optimizer, cx, cg, n_swap=n_swap)
+        return moved
+
+
 def build_ffn(cfg: GPTConfig) -> nn.Module:
     if cfg.ffn_type == "ple":
         return SwiGLUPLE(cfg)
@@ -386,6 +495,8 @@ def build_ffn(cfg: GPTConfig) -> nn.Module:
         return DenseSwiGLU(cfg)
     if cfg.ffn_type == "sparse_wide":
         return SparseWideSwiGLU(cfg)
+    if cfg.ffn_type == "block":
+        return BlockSparseSwiGLU(cfg)
     raise ValueError(f"unknown ffn_type {cfg.ffn_type!r}")
 
 
@@ -399,6 +510,7 @@ class TransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(C)
         self.attn = CausalSelfAttention(
             C, n_heads, cfg.head_dim, cfg.block_size,
+            n_kv_heads=cfg.n_kv_heads,
             sparse=cfg.sparse_attn, density=cfg.sparse_density,
         )
         self.ln2 = nn.LayerNorm(C)
@@ -431,6 +543,17 @@ class TinyGPT(nn.Module):
         self.lm_head = nn.Linear(C, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight  # tied
 
+        # Multi-token prediction: n_mtp parallel heads (Meta/Gloeckle style). Each
+        # reads the shared trunk hidden and predicts a further-future token through
+        # the (tied) unembedding. Head d predicts token t+1+d. Off when n_mtp == 0.
+        self.n_mtp = cfg.n_mtp
+        self.last_mtp_logits = None
+        if cfg.n_mtp > 0:
+            self.mtp_heads = nn.ModuleList([
+                nn.Sequential(nn.LayerNorm(C), nn.Linear(C, C, bias=False))
+                for _ in range(cfg.n_mtp)
+            ])
+
         # AttnRes: learned query vector per layer + final output
         if cfg.attn_res:
             self.ar_proj = nn.Parameter(torch.randn(n_layers + 1, C) * 0.02)
@@ -462,8 +585,43 @@ class TinyGPT(nn.Module):
                 x, cache_i = block(x, idx, pos_ids, kv_cache=kv_cache[i])
                 new_caches.append(cache_i)
 
-        x = self.ln_f(x)
+        h_trunk = x                                 # shared trunk hidden
+        x = self.ln_f(h_trunk)
+        if self.n_mtp and self.training:
+            self.last_mtp_logits = [
+                F.linear(head(h_trunk), self.tok_emb.weight) for head in self.mtp_heads
+            ]
+        else:
+            self.last_mtp_logits = None
         return self.lm_head(x), new_caches
+
+    def mtp_loss(self, y, ignore_index=-100):
+        """Auxiliary multi-token-prediction loss over the extra heads.
+
+        Main head predicts y[t] (= token t+1); MTP head d predicts y[t+d]
+        (= token t+1+d), so its logits at position t are matched against y
+        shifted left by d (the last d positions are dropped)."""
+        if not self.n_mtp or self.last_mtp_logits is None:
+            return torch.zeros((), device=self.tok_emb.weight.device)
+        V = self.cfg.vocab_size
+        T = y.shape[1]
+        total = torch.zeros((), device=y.device)
+        for d, lg in enumerate(self.last_mtp_logits, start=1):
+            if T - d <= 0:
+                continue
+            pred = lg[:, :T - d].reshape(-1, V)
+            tgt = y[:, d:].reshape(-1)
+            total = total + F.cross_entropy(pred, tgt, ignore_index=ignore_index)
+        return self.cfg.mtp_weight * total
+
+    @torch.no_grad()
+    def sparse_update(self, optimizer, n_swap):
+        """Grow-and-prune all block-sparse FFNs (no-op for other variants)."""
+        moved = 0
+        for m in self.modules():
+            if isinstance(m, BlockSparseSwiGLU):
+                moved += m.grow_prune(optimizer, n_swap)
+        return moved
 
     def _attn_res_combine(self, layer_outs, proj):
         """Softmax-weighted sum of previous layer outputs (no big stacks)."""
