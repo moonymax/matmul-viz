@@ -338,6 +338,35 @@ loose for *exact* top-K but excellent for ~95% recall on deep near-rank-1 layers
 (5-18x speedup). The cheapest gate already spends its 1 mult/cell optimally where
 gating is viable; the extra per-cell budget doesn't buy a better gate here.
 
+### 18. Reality check: the sparse KERNEL is the bottleneck, not grow-prune — `bench_step.py`
+End-to-end training-step wall-clock (MPS): dense-small (D=1024, 1.05M params),
+dense-wide (Sd=4096, 16.8M params, the operator sparse approximates), and sparse
+(Sd=4096, k=1.05M active = equal params to dense-small, density 6.2%) using the
+fused-Metal CSR kernel + norm-gate grow-prune.
+
+| phase | dense-small | dense-wide | sparse |
+|---|---|---|---|
+| fwd (ms) | 0.35 | 5.36 | **70.2** |
+| bwd (ms) | 0.35 | 20.9 | **385.0** |
+| step (ms) | 0.87 | 34.7 | 3.03 |
+| grow-prune amort (ms) | - | - | 1.61 (160 ms /100) |
+| **total** | **1.57** | 60.95 | **459.9** |
+
+- **Sparse is ~292x slower than equal-param dense, and 7.5x slower than the 16x-
+  bigger dense-wide it approximates.** Not competitive.
+- **The grow-prune overhead is NOT the problem** — amortized ~1.6 ms/step (≈ one
+  dense step). The searches (norm-gate topk, deadness, CSR rebuild) are cheap.
+- **The sparse fwd/bwd kernels are the catastrophe.** Same flops as dense-small
+  (k=D^2) but ~3.8 GMAC/s vs dense's ~766 GMAC/s — **~200x less efficient**. Root
+  cause: unstructured sparse = random memory access (`x[csr_col[t]]` scatters),
+  which is murder on GPU; dense GEMM is coalesced + MPS-optimized. This is the
+  classic reason unstructured sparsity doesn't accelerate dense hardware.
+Reframing: findings 9-17 (grow-gradient approximation) only matter if the sparse
+matmul can be made fast. Right now it can't (unstructured, memory-bound). Levers
+that would actually move wall-clock: **structured/block sparsity** (coalesced), a
+far better sparse kernel, or accepting sparse wins only on accuracy-per-param
+(finding 6) and in memory-bound / non-GPU regimes — not MPS wall-clock.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
