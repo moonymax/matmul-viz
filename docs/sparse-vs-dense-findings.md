@@ -298,6 +298,27 @@ layer-dependent; where it is low-rank (deep GELU) the cheapest rank-1 approximat
 is near-perfect. The approximation should be chosen per layer to match its rank.
 NOTE: D=256 persample numbers earlier were a coverage artifact; disregard them.
 
+### 16. Per-cell compute-gating: exact CS gate fails, approximate wins ~10-20x on deep layers — `cifar_gate.py`
+Framed the approximation as a per-cell economic decision: each cell G[i,j] costs
+B mults; a gate costing h<<B decides compute-or-skip. Exact Cauchy-Schwarz gate:
+skip if `‖da[:,i]‖·‖x[:,j]‖ < tau_K` (never drops a true top-K cell). Real CIFAR
+D=2048, K=1% budget:
+- **Exact gate is a dud: C_pass = 73-100% of cells survive** -> speedup ~1x. The
+  magnitude-only bound is too loose (ignores alignment/cancellation); one modest-
+  norm true-top-K cell drops tau_K enough that almost everything passes. The gate
+  cost h≈1<<B is fine -- the failure is *discrimination*, not gate cost.
+- **Approximate grow wins on deep layers** (reading recall@top-C%-by-bound, i.e.
+  compute only the top-C% of cells exactly): b3.w2 GELU hits 98% recall at 5% of
+  cells (**~20x fewer computed**), 100% at 10% (10x); b2.w2 97% at 10%; deep LN
+  similar. Shallow layers ~5x at 95%; **stem only ~2x** (needs 50% for 91%). Same
+  depth trend as finding 15 (deep gradients concentrated -> norm bound is a good
+  candidate generator).
+- **Budget implication:** we have B=256 mults/cell of gate budget; the norm gate
+  spends 1. Huge room for a tighter gate -- e.g. a random-projection sketch
+  `G[i,j] ≈ <P da[:,i], P x[:,j]>`, P: B->b' (b'≈16-32), h=b'<<B, capturing
+  *alignment* not just magnitude. Would tighten the bound and could make even
+  exact-recall gating cheap. (next experiment)
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
