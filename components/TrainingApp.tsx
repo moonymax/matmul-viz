@@ -10,6 +10,7 @@ import {
   MODE_META,
   PARAM_COUNT,
   LOWRANK_R,
+  BLOCK_B,
   SPARSE_DIM,
   DATASET_SIZE,
   Mode,
@@ -66,7 +67,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 export default function TrainingApp() {
   const sims = useMemo(() => buildSimulations(), []);
   const [mode, setMode] = useState<Mode>("sparse");
-  const [steps, setSteps] = useState<Record<Mode, number>>({ dense16: 0, sparse: 0, lowrank: 0 });
+  const [steps, setSteps] = useState<Record<Mode, number>>({ dense16: 0, sparse: 0, lowrank: 0, block: 0 });
   const [example, setExample] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(2);
@@ -199,7 +200,7 @@ export default function TrainingApp() {
 
         {/* tabs */}
         <div className="inline-flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-1">
-          {(["dense16", "sparse", "lowrank"] as Mode[]).map((m) => (
+          {(["dense16", "sparse", "block", "lowrank"] as Mode[]).map((m) => (
             <button
               key={m}
               onClick={() => {
@@ -210,7 +211,13 @@ export default function TrainingApp() {
                 mode === m ? "bg-sky-600 text-white" : "text-gray-400 hover:text-gray-200"
               }`}
             >
-              {m === "dense16" ? `Dense ${SPARSE_DIM}×${SPARSE_DIM}` : m === "sparse" ? "Sparse" : "Low-rank"}
+              {m === "dense16"
+                ? `Dense ${SPARSE_DIM}×${SPARSE_DIM}`
+                : m === "sparse"
+                ? "Sparse (cells)"
+                : m === "block"
+                ? `Block ${BLOCK_B}×${BLOCK_B}`
+                : "Low-rank"}
             </button>
           ))}
         </div>
@@ -320,7 +327,13 @@ export default function TrainingApp() {
                 <div className="flex items-center gap-3 mb-1.5">
                   <span className="text-sm font-semibold text-gray-200">Layer {i + 1}</span>
                   <span className="text-[11px] text-gray-500">
-                    {mode === "sparse" ? "sparse" : mode === "lowrank" ? `rank ${LOWRANK_R}` : "dense"}
+                    {mode === "sparse"
+                      ? "sparse cells"
+                      : mode === "block"
+                      ? `block ${BLOCK_B}×${BLOCK_B}`
+                      : mode === "lowrank"
+                      ? `rank ${LOWRANK_R}`
+                      : "dense"}
                   </span>
                   {L.sparse && (
                     <span className="flex items-center gap-3 text-[11px] text-gray-400">

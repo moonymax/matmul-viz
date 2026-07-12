@@ -10,7 +10,6 @@ cost capacity vs free cells? (finding 15 -> importance may cluster -> little cos
 """
 from __future__ import annotations
 
-import math
 import time
 import torch
 import torch.nn as nn
@@ -103,6 +102,7 @@ def train(kind, trl, tel):
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps, pct_start=0.1)
     is_sparse = kind != "dense"
     step, best = 0, 0.0
+    t0 = time.time()
     for epoch in range(EPOCHS):
         model.train()
         for xb, yb in trl:
@@ -125,7 +125,9 @@ def train(kind, trl, tel):
                 xb, yb = xb.to(DEV), yb.to(DEV)
                 cor += (model(xb).argmax(1) == yb).sum().item(); tot += yb.numel()
         acc = 100.0 * cor / tot; best = max(best, acc)
-    return best, n_params(model)
+        print(f"    [{kind}] epoch {epoch+1:2d}/{EPOCHS}  test {acc:5.2f}%  "
+              f"({time.time()-t0:5.1f}s)", flush=True)
+    return best, n_params(model), time.time() - t0
 
 
 def main():
@@ -136,10 +138,10 @@ def main():
     tel = torch.utils.data.DataLoader(te, batch_size=512, shuffle=False, num_workers=2,
                                       persistent_workers=True)
     print(f"CIFAR block-vs-cell capacity  S={S} L={L} density={DENSITY:.0%} epochs={EPOCHS}\n", flush=True)
-    print(f"  {'body':>10} {'params':>10} {'best test':>10}")
+    print(f"  {'body':>10} {'params':>10} {'best test':>10} {'train(s)':>9}")
     for kind in ["dense", "cell", "block16", "block32"]:
-        acc, p = train(kind, trl, tel)
-        print(f"  {kind:>10} {p:>10,} {acc:>9.2f}%", flush=True)
+        acc, p, secs = train(kind, trl, tel)
+        print(f"  {kind:>10} {p:>10,} {acc:>9.2f}% {secs:>8.1f}", flush=True)
     print("\n  cell vs block at equal params = capacity cost of block structure; dense = ceiling")
 
 
