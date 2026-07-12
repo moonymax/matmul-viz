@@ -387,6 +387,34 @@ SRAM. Same step benchmark (Sd=4096, k=1M):
   `grad_val` reads `x` *by column across the batch*, which per-batch-row caching
   can't help -- that needs the transposed-layout representation change (next step).
 
+### 20. Forward slowdown decomposed: gather ~2x, bank-conflicts ~2-3.5x, GEMM-gap ~28x — `bench_fwd_diag.py`
+Instrumented the cached forward with env knobs (mode global/cached/seq, threadgroup
+size) to isolate causes at Sd=4096, k=1M vs a dense Linear of the same MAC count
+(0.37 ms):
+
+| config | time (ms) | vs dense |
+|---|---|---|
+| global (uncached) | 66.3 | 177x |
+| cached TG=128 | 22.8 | 61x |
+| cached TG=256 | 36.8 | 98x |
+| seq (broadcast shared) TG=256 | 10.6 | 28x |
+
+Three separable factors:
+1. **DRAM gather ~2x** (global -> cached). Caching x on-chip (finding 19). Smallest.
+2. **Shared-memory bank conflicts ~2-3.5x** (cached -> seq). `seq` does identical
+   work but all warp threads read the *same* xs index/step (broadcast), while the
+   real kernel's `xs[csr_col[t]]` scatters threads across banks -> conflicts. The
+   biggest *fixable* remaining piece (padding / reorder so a warp hits distinct
+   banks). Occupancy (TG sweep) is secondary and noisy (TG=128 best).
+3. **~28x irreducible residual: scalar loop vs optimized GEMM.** Even `seq` (no
+   gather, no conflicts, perfect shared access) is 28x dense. Dense rides the GPU
+   tiled/register-blocked **matmul units (SIMD-group matmul)**; a per-nonzero
+   scalar-FMA kernel structurally can't use them on scattered data.
+Punchline: software fixes (cache + de-conflict) get to ~10 ms ≈ 28x dense; the
+28x floor is the cost of not using the matmul hardware. Only **dense blocks** feed
+those units -> quantitative case for moveable block-sparsity. (Diagnostic env
+knobs default to `cached`; normal path unaffected.)
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when

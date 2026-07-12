@@ -19,6 +19,8 @@
 //
 // Toolchain recipe mirrors the proven mps_probe.mm.
 
+#include <cstdlib>
+#include <string>
 #include <torch/extension.h>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/mps/MPSDevice.h>
@@ -79,6 +81,34 @@ kernel void sparse_forward_cached(device const float* x        [[buffer(0)]],
         int end   = crow[i + 1];
         float acc = 0.0f;
         for (int t = start; t < end; ++t) acc += val[t] * xs[csr_col[t]];
+        out[(ulong)b * out_f + i] = acc;
+    }
+}
+
+// DIAGNOSTIC ONLY (wrong output): identical work/structure to the cached kernel
+// but reads xs SEQUENTIALLY (xs[t-start]) instead of the random xs[csr_col[t]].
+// All threads in a warp read the same xs index each iteration -> broadcast, no
+// bank conflicts. Timing gap vs the cached kernel = the random-shared-access cost.
+kernel void sparse_forward_cached_seq(device const float* x        [[buffer(0)]],
+                                      device const float* val      [[buffer(1)]],
+                                      device const int*   crow     [[buffer(2)]],
+                                      device const int*   csr_col  [[buffer(3)]],
+                                      device float*       out      [[buffer(4)]],
+                                      constant uint&      B        [[buffer(5)]],
+                                      constant uint&      in_f     [[buffer(6)]],
+                                      constant uint&      out_f    [[buffer(7)]],
+                                      threadgroup float*  xs       [[threadgroup(0)]],
+                                      uint b   [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_position_in_threadgroup]],
+                                      uint T   [[threads_per_threadgroup]]) {
+    device const float* xb = x + (ulong)b * in_f;
+    for (uint j = tid; j < in_f; j += T) xs[j] = xb[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < out_f; i += T) {
+        int start = crow[i];
+        int end   = crow[i + 1];
+        float acc = 0.0f;
+        for (int t = start; t < end; ++t) acc += val[t] * xs[t - start];
         out[(ulong)b * out_f + i] = acc;
     }
 }
@@ -185,6 +215,10 @@ static id<MTLComputePipelineState> psoForward(id<MTLDevice> d) {
 }
 static id<MTLComputePipelineState> psoForwardCached(id<MTLDevice> d) {
     static id<MTLComputePipelineState> p = makePipeline(d, FWD_GX_SRC, "sparse_forward_cached");
+    return p;
+}
+static id<MTLComputePipelineState> psoForwardCachedSeq(id<MTLDevice> d) {
+    static id<MTLComputePipelineState> p = makePipeline(d, FWD_GX_SRC, "sparse_forward_cached_seq");
     return p;
 }
 static id<MTLComputePipelineState> psoGradX(id<MTLDevice> d) {
@@ -294,15 +328,34 @@ torch::Tensor sparse_forward(torch::Tensor x, torch::Tensor values,
     uint32_t out_f = static_cast<uint32_t>(out_features);
     auto out = torch::empty({(int64_t)B, (int64_t)out_f}, x.options());
 
-    // x-cached forward: stage x[b,:] in threadgroup memory (must fit in 32KB).
-    TORCH_CHECK(in_f * sizeof(float) <= 32768,
-                "sparse_forward_cached needs in_f <= 8192 (threadgroup memory)");
+    // Diagnostic knobs (env): SPARSE_FWD_MODE = cached (default) | seq | global;
+    // SPARSE_FWD_TG = threadgroup size for the cached/seq paths (default 256).
+    const char* modeE = getenv("SPARSE_FWD_MODE");
+    std::string mode = modeE ? modeE : "cached";
+    const char* tgE = getenv("SPARSE_FWD_TG");
+    NSUInteger reqT = tgE ? (NSUInteger)atoi(tgE) : 256;
+
     id<MTLDevice> device = at::mps::MPSDevice::getInstance()->device();
     at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
+
+    if (mode == "global") {                     // old uncached path (reference)
+        dispatch_sync(stream->queue(), ^() {
+            stream->endKernelCoalescing();
+            id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
+            encForward(enc, device, x, values, crow, csr_col, out, B, in_f, out_f);
+            [enc endEncoding];
+            stream->synchronize(at::mps::SyncType::COMMIT);
+        });
+        return out;
+    }
+
+    TORCH_CHECK(in_f * sizeof(float) <= 32768,
+                "cached forward needs in_f <= 8192 (threadgroup memory)");
     dispatch_sync(stream->queue(), ^() {
         stream->endKernelCoalescing();
         id<MTLComputeCommandEncoder> enc = [stream->commandBuffer() computeCommandEncoder];
-        id<MTLComputePipelineState> pso = psoForwardCached(device);
+        id<MTLComputePipelineState> pso = (mode == "seq")
+            ? psoForwardCachedSeq(device) : psoForwardCached(device);
         [enc setComputePipelineState:pso];
         setBuf(enc, x, 0); setBuf(enc, values, 1); setBuf(enc, crow, 2);
         setBuf(enc, csr_col, 3); setBuf(enc, out, 4);
@@ -310,7 +363,7 @@ torch::Tensor sparse_forward(torch::Tensor x, torch::Tensor values,
         [enc setBytes:&in_f length:sizeof(in_f) atIndex:6];
         [enc setBytes:&out_f length:sizeof(out_f) atIndex:7];
         [enc setThreadgroupMemoryLength:(NSUInteger)in_f * sizeof(float) atIndex:0];
-        NSUInteger T = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        NSUInteger T = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup, reqT);
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)B, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(T, 1, 1)];
         [enc endEncoding];
