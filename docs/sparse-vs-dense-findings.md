@@ -273,6 +273,31 @@ rowexact's 0.8-0.89 on its own. Same underlying obstacle as findings 9/13: the
 grow gradient is high-rank/diffuse, so no single cheap axis (rows, cols, or
 samples) reconstructs its top cells cheaply.
 
+### 15. On REAL data the grow gradient's rank is layer-dependent; cheapest method wins where it's low-rank — `cifar_approx.py`
+Switched to real CIFAR (dense ResFFN, per user directive to stop using synthetic).
+Compared cheap rank-1 cell-scorings (score(i,j)=row_i*col_j; top rows x top cols),
+per-sample rank-1 union, and rowexact, vs the oracle top-K (K=1% of cells, a
+realistic grow budget). Rank-1 batch reductions:
+  sum_signed = |sum_b da[b,i]| x |sum_b x[b,j]|   (the "add the batch" idea)
+  sum_abs / l2norm = L1 / L2 batch norms per row/col.
+At D=2048 (overlap/selQ vs oracle):
+- **`persample` is a coverage artifact** — at D=256 its union was ~90% of the
+  matrix (looked great, 0.90); at D=2048 the union is a genuine 1.3-2.7% of D^2
+  and it drops to ~0.3-0.44 overlap. Not a real win.
+- **`sum_signed` (batch-sum rank-1, ~free O(B*D)) is BEST on deep GELU layers**,
+  with selQ climbing with depth: 0.38 -> 0.49 -> 0.82 -> **0.96** (blocks 0-3).
+  It is exact when the batch gradients align (G ≈ da_sum (x) x_sum); deep
+  post-GELU activations after training are dominated by a few consistent
+  directions -> the grow gradient there is near **rank-1**, so the cheapest method
+  captures ~all of it. Cancellation only hurt sum_signed on high-rank layers.
+- **LN-fed layers stay higher-rank**: rowexact (0.66-0.87 selQ) and the norm rank-1
+  (0.67-0.89) win there; sum_signed weaker.
+Big picture: findings 9/13/14 ("gradient high-rank, nothing cheap works") were the
+**isotropic-synthetic worst case**. On real data the grow-gradient rank is
+layer-dependent; where it is low-rank (deep GELU) the cheapest rank-1 approximation
+is near-perfect. The approximation should be chosen per layer to match its rank.
+NOTE: D=256 persample numbers earlier were a coverage artifact; disregard them.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
