@@ -415,6 +415,39 @@ Punchline: software fixes (cache + de-conflict) get to ~10 ms ≈ 28x dense; the
 those units -> quantitative case for moveable block-sparsity. (Diagnostic env
 knobs default to `cached`; normal path unaffected.)
 
+### 21. Moveable block-sparse cracks the wall-clock problem: 292x -> 2.3x dense — `block_sparse.py`, `bench_block.py`
+Implemented a moveable dense-block layer (whole b x b blocks grown & pruned on a
+(out/b)x(in/b) grid). Forward = **batched dense matmul (bmm) over active blocks**
+(gather input col-tile -> bmm -> scatter-add by output block-row), so it runs on
+the GPU matmul units; backward is plain autograd over bmm/gather/index_add.
+Grow-prune = block-deadness (Frobenius norm of weight AND momentum AND gradient)
++ block-level norm-gate growth. Same benchmark as finding 18 (Sd=4096, k=1M):
+
+| model | fwd | bwd | step | grow-pr | total | vs dense-small |
+|---|---|---|---|---|---|---|
+| dense-small (D=1024) | 0.26 | 0.19 | 0.82 | - | 1.27 | 1.0x |
+| dense-wide (Sd=4096) | 9.7 | 6.0 | 36.6 | - | 52.3 | 41x |
+| scalar CSR (finding 18) | 33 | 299 | 1.2 | 1.6 | 335 | 234x |
+| block b=64 | 6.9 | 1.7 | 1.0 | 0.04 | 9.7 | 7.6x |
+| block b=128 | 3.2 | 2.1 | 0.97 | 0.02 | 6.3 | 4.9x |
+| **block b=256** | 0.99 | 0.92 | 0.91 | 0.05 | **2.87** | **2.3x** |
+
+- **292x -> 2.3x dense-small** (b=256): ~120x faster than the scalar unstructured
+  kernel. The wall-clock problem is essentially solved by expressing sparsity as
+  batched dense matmul on the matmul units.
+- **Grow-prune is free** (~0.02-0.05 ms amortized): block-grid searches are tiny.
+- **Backward rides the units too** (bmm autograd): 0.9 ms vs the scalar 299 ms.
+- **Block size = speed vs adaptivity knob**: bigger -> faster (fewer/larger
+  matmuls approach one GEMM) but coarser placement (b=256 -> only 16 blocks on a
+  16x16 grid; b=64 -> 256 blocks on 64x64). b=128 a reasonable middle (4.9x, 64
+  blocks). Still a wide Sd=4096 operator (the finding-6 representational win).
+- Residual 2.3x at b=256 = bmm-launch + gather/scatter overhead (16 batched
+  256x256 matmuls vs one fused GEMM), not the matmul-unit gap -> closable with a
+  fused block kernel. Correctness verified vs dense (max abs diff ~1e-7).
+Open: pick block size by the speed/adaptivity trade-off; confirm moveable blocks
+train as well per-param on real data (does importance cluster into blocks,
+finding 15 suggests yes); optional fused block kernel to shave the last few x.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
