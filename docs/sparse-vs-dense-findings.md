@@ -448,6 +448,31 @@ Open: pick block size by the speed/adaptivity trade-off; confirm moveable blocks
 train as well per-param on real data (does importance cluster into blocks,
 finding 15 suggests yes); optional fused block kernel to shave the last few x.
 
+### 22. Block-sparse costs only ~1% capacity vs cell-sparse on real CIFAR — `cifar_block_vs_cell.py`
+Representational-capacity comparison at EQUAL params: same residual FFN, body
+layers S=512 as dense (full) / cell-sparse / block-sparse (b=16,32), all with
+grow-and-prune, density 25%, 20 epochs real CIFAR:
+
+| body | params | best test |
+|---|---|---|
+| dense (full) | 3.68M | 61.59% |
+| cell (free) | 2.11M | 60.05% |
+| block b=16 | 2.11M | 58.98% |
+| block b=32 | 2.11M | 59.24% |
+
+**Block-sparse costs only ~0.8-1.1% accuracy vs free cells at equal params** — a
+small tax, as the coherence argument predicts for structured real data (blocks
+lose capacity only when importance is high-rank/scattered; real deep-layer
+structure is low-rank/channel-clustered per finding 15). b=32 ~= b=16 (not worse).
+So blocks buy the ~120x wall-clock win (finding 21) for ~1% capacity on real data.
+Brainstorm summary of the trade-off: same param count; blocks have strictly less
+placement freedom (union-of-rectangles support) and are rank-capped at ~k/b
+(vs ~k for cells) so they lose on *high-rank* targets, but give full local mixing
+and match cells on low-rank/clustered targets. b is the capacity<->speed knob
+(b=1 = cell); migration lets blocks chase coherent structure. Caveat: single
+density (25%), single seed; the gap likely widens at very low density (rank cap
+bites) and on incoherent/synthetic targets.
+
 ## Caveats
 - Single-seed, small synthetic nets; regularization effects are modest (~few %).
 - The headline conclusions (grow-prune > static; dense ties sparse when
