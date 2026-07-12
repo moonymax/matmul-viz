@@ -54,12 +54,21 @@ class GPTConfig:
     attn_res: bool = True
 
     # --- FFN selection ---
-    ffn_type: str = "ple"           # {"ple", "sparse", "moe"}
+    ffn_type: str = "ple"           # {"ple", "sparse", "moe", "dense", "sparse_wide"}
 
     # --- "sparse" variant ---
     sparse_hidden: int = 6144
     sparse_density: float = 0.25
     sparse_attn: bool = False   # also make attention qkv/proj SparseLinear
+
+    # --- "dense" variant (plain bias-free SwiGLU, param-equal baseline) ---
+    dense_hidden: int = 512
+
+    # --- "sparse_wide" variant (very wide FFN, fused Metal SparseLinear) ---
+    #   param-equal to "dense" by construction:
+    #   k(gate)=k(up)=k(down)=round(density * embed_dim * wide_hidden)
+    wide_hidden: int = 51200
+    wide_density: float = 0.01
 
     # --- "moe" variant (DeepSeek-V3 style, fine-grained) ---
     moe_n_routed: int = 16          # number of fine-grained routed experts
@@ -78,7 +87,8 @@ class GPTConfig:
         return self.uniform_heads * self.head_dim
 
     def validate(self):
-        assert self.ffn_type in ("ple", "sparse", "moe"), f"bad ffn_type {self.ffn_type}"
+        assert self.ffn_type in ("ple", "sparse", "moe", "dense", "sparse_wide"), \
+            f"bad ffn_type {self.ffn_type}"
         assert self.attn_dim != self.embed_dim, (
             f"design constraint violated: n_heads*head_dim ({self.attn_dim}) "
             f"must differ from embed_dim ({self.embed_dim})"
@@ -303,6 +313,68 @@ class MoEFFN(nn.Module):
         return out.reshape(B, T, C)
 
 
+# --------------------------------------------------------------------------- #
+# FFN variant 4: plain bias-free SwiGLU (dense baseline for the param-equal
+# dense-vs-sparse-wide experiment)
+# --------------------------------------------------------------------------- #
+class DenseSwiGLU(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        C = cfg.embed_dim
+        H = cfg.dense_hidden
+        self.gate = nn.Linear(C, H, bias=False)
+        self.up = nn.Linear(C, H, bias=False)
+        self.down = nn.Linear(H, C, bias=False)
+
+    def forward(self, x, token_ids=None):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+# --------------------------------------------------------------------------- #
+# FFN variant 5: VERY-WIDE bias-free SwiGLU with fused-Metal SparseLinear
+# projections at low density -> param-equal to DenseSwiGLU by construction.
+# Gradient-checkpointed so the (tokens, wide_hidden) activation is recomputed
+# in backward rather than stored across all layers.  SparseLinearMetal is
+# imported LAZILY so this module stays importable without the Metal toolchain.
+# --------------------------------------------------------------------------- #
+class SparseWideSwiGLU(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        try:
+            import sys, os
+            _metal = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "metal")
+            if _metal not in sys.path:
+                sys.path.insert(0, _metal)
+            from sparse_metal import SparseLinearMetal
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "SparseWideSwiGLU needs python/metal/sparse_metal.py (Metal/MPS)"
+            ) from e
+
+        C = cfg.embed_dim
+        H = cfg.wide_hidden
+        d = cfg.wide_density
+        k_in = max(1, int(round(d * C * H)))    # dim -> hidden
+        k_out = max(1, int(round(d * H * C)))   # hidden -> dim
+        self.gate = SparseLinearMetal(C, H, k_in)
+        self.up = SparseLinearMetal(C, H, k_in)
+        self.down = SparseLinearMetal(H, C, k_out)
+
+    def _inner(self, xf):
+        h = F.silu(self.gate(xf)) * self.up(xf)
+        return self.down(h)
+
+    def forward(self, x, token_ids=None):
+        B, T, C = x.shape
+        xf = x.reshape(-1, C)
+        if self.training and xf.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+            out = checkpoint(self._inner, xf, use_reentrant=False)
+        else:
+            out = self._inner(xf)
+        return out.reshape(B, T, C)
+
+
 def build_ffn(cfg: GPTConfig) -> nn.Module:
     if cfg.ffn_type == "ple":
         return SwiGLUPLE(cfg)
@@ -310,6 +382,10 @@ def build_ffn(cfg: GPTConfig) -> nn.Module:
         return SparseSwiGLU(cfg)
     if cfg.ffn_type == "moe":
         return MoEFFN(cfg)
+    if cfg.ffn_type == "dense":
+        return DenseSwiGLU(cfg)
+    if cfg.ffn_type == "sparse_wide":
+        return SparseWideSwiGLU(cfg)
     raise ValueError(f"unknown ffn_type {cfg.ffn_type!r}")
 
 
